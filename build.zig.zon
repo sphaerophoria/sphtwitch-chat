@@ -1,0 +1,13 @@
+.{
+    .name = .twitch_chat,
+    .version = "0.0.1",
+    .fingerprint = 0x4950080adfbcebd2,
+    .dependencies = .{
+        .sphws = .{ .path = "../sphws" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
