@@ -1,0 +1,6 @@
+[submodule "sphws"]
+	path = sphws
+	url = ../sphws
+[submodule "sphtud"]
+	path = sphtud
+	url = ../sphtud
