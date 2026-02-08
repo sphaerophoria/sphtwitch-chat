@@ -1,5 +1,7 @@
 const std = @import("std");
 const sphws = @import("sphws");
+const sphtud = @import("sphtud");
+
 
 const CommonMessage  = struct {
     metadata: struct {
@@ -162,8 +164,8 @@ fn registerForChat(scratch: std.mem.Allocator, client: *std.http.Client, welcome
 
     std.debug.print("status: {d}\n", .{response.status});
     std.debug.print("body: {s}\n", .{response_writer.written()});
-
 }
+
 
 //{"metadata":{"message_id":"aeb3ba8b-7595-46fb-817e-c685a878f0e4","message_type":"session_welcome","message_timestamp":"2026-02-01T22:19:28.109022754Z"},"payload":{"session":{"id":"AgoQqRwUUsmySNezH4ZTJ8KsuxIGY2VsbC1h","status":"connected","connected_at":"2026-02-01T22:19:28.104472057Z","keepalive_timeout_seconds":10,"reconnect_url":null,"recovery_url":null}}}
 pub fn main() !void {
@@ -171,7 +173,6 @@ pub fn main() !void {
     // We have 8M of stack space to waste
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 
@@ -184,16 +185,11 @@ pub fn main() !void {
     try std.posix.getrandom(std.mem.asBytes(&seed));
     var rng = std.Random.DefaultPrng.init(seed);
 
-
     var http_client = std.http.Client {
         .allocator = gpa.allocator(),
     };
 
-    const uri = try std.Uri.parse("wss://eventsub.wss.twitch.tv/ws");
-    const host = try uri.getHostAlloc(alloc);
-    const port = try sphws.conn.resolveWsPort(uri);
-    const path = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(uri.path, .formatRaw)});
-    const scheme = try sphws.conn.WsScheme.fromUri(uri);
+    const uri_meta = try sphws.UriMetadata.fromString(arena.allocator(), "wss://eventsub.wss.twitch.tv/ws");
 
     var ca_bundle = std.crypto.Certificate.Bundle{};
     try ca_bundle.rescan(alloc);
@@ -201,13 +197,13 @@ pub fn main() !void {
     const connection = try alloc.create(sphws.conn.Connection);
 
     // FIXME: If not using TLS do we really want our bundle?
-    try connection.initPinned(alloc, ca_bundle, scheme, host, port);
+    try connection.initPinned(alloc, ca_bundle, uri_meta);
 
     std.debug.print("Connected!\n", .{});
 
     const reader = connection.reader();
     const writer = connection.writer();
-    var ws = try sphws.Websocket.init(reader, writer, host, path, rng.random());
+    var ws = try sphws.Websocket.init(reader, writer, uri_meta.host, uri_meta.path, rng.random());
     try connection.flush();
 
     const secret_file = try std.fs.cwd().openFile("secret/sphaerobot_token.txt", .{});
@@ -240,7 +236,7 @@ pub fn main() !void {
                 // * re-init self.ws
                 unreachable;
             },
-            .frame => |f| {
+            .message => |f| {
                 const data = try f.data.allocRemaining(scratch.allocator(), .unlimited);
 
                 const common = try std.json.parseFromSliceLeaky(CommonMessage, scratch.allocator(), data, .{.ignore_unknown_fields = true});

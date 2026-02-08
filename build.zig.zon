@@ -3,7 +3,8 @@
     .version = "0.0.1",
     .fingerprint = 0x4950080adfbcebd2,
     .dependencies = .{
-        .sphws = .{ .path = "../sphws" },
+        .sphws = .{ .path = "./sphws" },
+        .sphtud = .{ .path = "./sphws/sphtud" },
     },
     .paths = .{
         "build.zig",
