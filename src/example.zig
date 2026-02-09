@@ -4,6 +4,7 @@ const http = @import("http.zig");
 const sphws = @import("sphws");
 const EventIdIter = @import("EventIdIter.zig");
 const as = @import("auth_server.zig");
+const event_sub = @import("event_sub.zig");
 
 const EventIdList = struct {
     auth: as.EventIdList,
@@ -17,22 +18,6 @@ const EventIdList = struct {
         };
     }
 };
-
-// FIXME: This surely will come up a lot, move into sphtud
-fn isWouldBlock(r: *std.net.Stream.Reader, e: anyerror) bool {
-    switch (e) {
-        error.ReadFailed => {
-            const se = r.getError() orelse return false;
-            switch (se) {
-                error.WouldBlock => return true,
-                else => {},
-            }
-        },
-        else => {},
-    }
-
-    return false;
-}
 
 
 //const TwitchWebsocketSub = struct {
@@ -245,151 +230,8 @@ fn isWouldBlock(r: *std.net.Stream.Reader, e: anyerror) bool {
 //    }
 //};
 //
-const EventSubRegisterState = struct {
-    alloc: std.mem.Allocator,
-
-    websocket_id: ?[]const u8,
-    oauth_key: ?[]const u8,
-    state: ?[]const u8,
-
-    fn setWsId(self: *EventSubRegisterState, id: []const u8) !void {
-        std.debug.assert(self.websocket_id == null);
-        self.websocket_id = try self.alloc.dupe(u8, id);
-        try self.maybeRegisterSocket();
-    }
-
-    fn setOauthKey(self: *EventSubRegisterState, key: []const u8, state: []const u8) !void {
-        const expected_state = self.state orelse return error.NoOutstandingRequest;
-        if (!std.mem.eql(u8, state, expected_state)) return error.UnexpectedState;
-
-        std.debug.assert(self.oauth_key == null);
-        self.oauth_key = try self.alloc.dupe(u8, key);
-        try self.maybeRegisterSocket();
-    }
-
-    fn maybeRegisterSocket(self: *EventSubRegisterState) !void {
-        const ws_id = self.websocket_id orelse return;
-        const oauth_key = self.oauth_key orelse return;
-        _ = ws_id;
-        _ = oauth_key;
-
-        std.debug.print("Have WS ID and key\n", .{});
-
-        //const chat_id = "51219542";
-        //const bot_id = "51219542";
-        //try self.spawner.spawnRegisterEventSub(chat_id, bot_id, ws_id, oauth_key);
-    }
-};
 
 
-const EventSubWs = struct {
-    // FIXME: Looks like duplication with our above TlsConnection
-    conn: sphws.conn.TlsConnection,
-    ws: sphws.Websocket,
-
-    scratch: std.mem.Allocator,
-    ws_data_buf: [8192]u8 = undefined,
-
-    message_content: struct {
-        buf: [max_message_size]u8 = undefined,
-        writer: std.Io.Writer,
-    },
-
-    state: union(enum) {
-        default,
-        message: *std.Io.Reader,
-    },
-
-    event_sub_reg_state: *EventSubRegisterState,
-
-    // We are expecting to have 1, mayyyybe 2 websockets for the whole app, so
-    // we can just shove our entire message content in here for now
-    const max_message_size = 512 * 1024;
-
-    pub fn initPinned(self: *EventSubWs, scratch: std.mem.Allocator, ca_bundle: std.crypto.Certificate.Bundle, uri_meta: sphws.UriMetadata, random: std.Random, event_sub_reg_state: *EventSubRegisterState) !void {
-        try self.conn.initPinned(scratch, ca_bundle, uri_meta);
-        self.ws = try sphws.Websocket.init(&self.conn.tls_client.reader, &self.conn.tls_client.writer, uri_meta.host, uri_meta.path, random);
-        try self.conn.flush();
-        self.message_content.writer = std.Io.Writer.fixed(&self.message_content.buf);
-        self.scratch = scratch;
-        self.state = .default;
-        self.event_sub_reg_state = event_sub_reg_state;
-    }
-
-    fn poll(self: *EventSubWs) !noreturn {
-        while (true) {
-            switch (self.state) {
-                .default => try self.pollDefault(),
-                .message => |data| try self.pollMessageData(data),
-            }
-        }
-    }
-
-    fn pollMessageData(self: *EventSubWs, data: *std.Io.Reader) !void {
-        // Read json message
-        const CommonMessage  = struct {
-            metadata: struct {
-                message_type: []const u8,
-            },
-        };
-
-        // FIXME: These types need to live somewhere else
-        const MessageType = enum {
-            session_welcome,
-            notification
-        };
-
-        _ = try data.streamRemaining(&self.message_content.writer);
-
-        self.state = .default;
-
-        // FIXME: We probably actually want to reset the scratch allocator here
-        const message = std.json.parseFromSliceLeaky(CommonMessage, self.scratch, self.message_content.writer.buffered(), .{ .ignore_unknown_fields = true }) catch {
-            std.log.err("Invalid json message: {s}\n", .{self.message_content.writer.buffered()});
-            return;
-        };
-
-
-        std.debug.print("Received message: {any}\n", .{message});
-
-        const message_type = std.meta.stringToEnum(MessageType, message.metadata.message_type) orelse return;
-        switch (message_type) {
-            .session_welcome => {
-                const SessionWelcome = struct {
-                    payload: struct {
-                        session: struct {
-                            id: []const u8,
-                            keepalive_timeout_seconds: u32,
-                        },
-                    },
-                };
-
-                const welcome = std.json.parseFromSliceLeaky(SessionWelcome, self.scratch, self.message_content.writer.buffered(), .{ .ignore_unknown_fields = true }) catch {
-                    std.log.err("Invalid welcome message: {s}\n", .{self.message_content.writer.buffered()});
-                    return;
-                };
-
-                std.debug.print("Setting websocket id: {s}\n", .{welcome.payload.session.id});
-                try self.event_sub_reg_state.setWsId(welcome.payload.session.id);
-            },
-            .notification => {},
-        }
-    }
-
-    fn pollDefault(self: *EventSubWs) !void {
-        const res = try self.ws.poll(&self.ws_data_buf);
-
-        switch (res) {
-            .initialized => {},
-            .message => |message| {
-                self.state = .{ .message =  message.data } ;
-                return;
-            },
-            .redirect => unreachable,
-            .none => {},
-        }
-    }
-};
 
 // An idea on how to do generic HTTP fetches
 //
@@ -456,7 +298,16 @@ pub fn main() !void {
 
     var loop = try sphtud.event.Loop2.init();
 
-    var auth_server = try as.AuthServer(id_list.auth).init(&loop, alloc, expansion);
+    // FIXME: I feel like this should be completely nuked after registration is
+    // complete. Surely there's some union somewhere
+    var es_state = event_sub.RegisterState {
+        .oauth_key = null,
+        .websocket_id = null,
+        .alloc = alloc,
+        .state = "1234",
+    };
+
+    var auth_server = try as.AuthServer(id_list.auth).init(&loop, alloc, expansion, &es_state);
 
     var ca_bundle = std.crypto.Certificate.Bundle{};
     // FIXME: LOL GPA please
@@ -466,23 +317,15 @@ pub fn main() !void {
     try std.posix.getrandom(std.mem.asBytes(&seed));
     var rng = std.Random.DefaultPrng.init(seed);
 
-    // FIXME: I feel like this should be completely nuked after registration is
-    // complete. Surely there's some union somewhere
-    var event_sub_register_state = EventSubRegisterState {
-        .oauth_key = null,
-        .websocket_id = null,
-        .alloc = alloc,
-        .state = "1234",
-    };
-
     const uri_meta = try sphws.UriMetadata.fromString(alloc, "wss://eventsub.wss.twitch.tv/ws");
-    var event_sub_ws: EventSubWs = undefined;
-    try event_sub_ws.initPinned(scratch.allocator(), ca_bundle, uri_meta, rng.random(), &event_sub_register_state);
-
-    try sphtud.event.setNonblock(event_sub_ws.conn.stream.handle);
+    var event_sub_conn: event_sub.Connection = undefined;
+    try event_sub_conn.initPinned(scratch.allocator(), ca_bundle, uri_meta, rng.random(), &es_state);
+    // FIXME: event_sub.Connection can probably be event loop aware which cuts
+    // down on this clutter in main
+    try sphtud.event.setNonblock(event_sub_conn.conn.stream.handle);
 
     try loop.register(.{
-        .handle = event_sub_ws.conn.stream.handle,
+        .handle = event_sub_conn.conn.stream.handle,
         .id = id_list.websocket,
         .read = true,
         .write = false,
@@ -495,10 +338,7 @@ pub fn main() !void {
                 try auth_server.poll(scratch, event);
             },
             id_list.websocket => {
-                event_sub_ws.poll() catch |e| {
-                    if (isWouldBlock(&event_sub_ws.conn.stream_reader, e)) continue;
-                    return e;
-                };
+                try event_sub_conn.poll(scratch);
             },
             else => unreachable,
         }

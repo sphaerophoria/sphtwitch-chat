@@ -2,6 +2,7 @@ const sphtud = @import("sphtud");
 const http = @import("http.zig");
 const std = @import("std");
 const EventIdIter = @import("EventIdIter.zig");
+const event_sub = @import("event_sub.zig");
 
 const max_auth_connections = 100;
 
@@ -9,13 +10,14 @@ pub fn AuthServer(comptime ids: EventIdList) type {
     return struct {
         serv: std.net.Server,
         connections: sphtud.util.ObjectPool(Connection, usize),
+        event_sub_reg_state: *event_sub.RegisterState,
 
         expansion: sphtud.util.ExpansionAlloc,
         loop: *sphtud.event.Loop2,
 
         const Self = @This();
 
-        pub fn init(loop: *sphtud.event.Loop2, alloc: std.mem.Allocator, expansion: sphtud.util.ExpansionAlloc) !Self {
+        pub fn init(loop: *sphtud.event.Loop2, alloc: std.mem.Allocator, expansion: sphtud.util.ExpansionAlloc, event_sub_reg_state: *event_sub.RegisterState) !Self {
             const address = std.net.Address.initIp4(.{0, 0, 0, 0}, 9342);
             const serv = try address.listen(.{
                 .reuse_address = true,
@@ -31,6 +33,7 @@ pub fn AuthServer(comptime ids: EventIdList) type {
 
             return .{
                 .serv = serv,
+                .event_sub_reg_state = event_sub_reg_state,
                 .connections = try .init(
                     alloc,
                     expansion,
@@ -74,7 +77,7 @@ pub fn AuthServer(comptime ids: EventIdList) type {
 
                     const conn = self.connections.get(id);
 
-                    switch (conn.poll(scratch)) {
+                    switch (conn.poll(scratch, self)) {
                         .wait => return,
                         .close => try self.releaseConnection(id),
                     }
@@ -139,12 +142,12 @@ const Connection = struct {
         close,
     };
 
-    fn poll(self: *Connection, scratch: sphtud.alloc.LinearAllocator) PollResponse {
+    fn poll(self: *Connection, scratch: sphtud.alloc.LinearAllocator, parent: anytype) PollResponse {
         const cp = scratch.checkpoint();
         while (true) {
             defer scratch.restore(cp);
 
-            self.pollInner(scratch) catch |e| {
+            self.pollInner(scratch, parent) catch |e| {
                 // FIXME: It feels like this isn't our responsibility
                 if (self.http.isWouldBlock2(e)) return .wait;
                 if (e == error.EndOfStream) return .close;
@@ -160,10 +163,10 @@ const Connection = struct {
         }
     }
 
-    fn pollInner(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
+    fn pollInner(self: *Connection, scratch: sphtud.alloc.LinearAllocator, parent: anytype) !void {
         switch (self.state) {
             .default => try self.pollDefault(scratch.allocator()),
-            .auth_body => |r| try self.pollAuthBody(scratch.allocator(), r),
+            .auth_body => |r| try self.pollAuthBody(scratch.allocator(), r, parent),
         }
     }
 
@@ -204,7 +207,7 @@ const Connection = struct {
         }
     }
 
-    fn pollAuthBody(self: *Connection, scratch: std.mem.Allocator, r: *std.Io.Reader) !void {
+    fn pollAuthBody(self: *Connection, scratch: std.mem.Allocator, r: *std.Io.Reader, parent: anytype) !void {
         _ = try r.streamRemaining(&self.content_writer);
 
         self.state = .default;
@@ -223,7 +226,7 @@ const Connection = struct {
         };
 
         std.debug.print("Got auth response {any}\n", .{auth_response});
-        //try self.parent.event_sub_reg_state.setOauthKey(auth_response.access_token, auth_response.state);
+        try parent.event_sub_reg_state.setOauthKey(auth_response.access_token, auth_response.state);
     }
 
     const RelevantParams = struct {
