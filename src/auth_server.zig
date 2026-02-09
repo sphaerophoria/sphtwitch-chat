@@ -42,6 +42,7 @@ pub fn AuthServer(comptime ids: EventIdList) type {
             };
         }
 
+        // FIXME: Error return type should be well defined here
         pub fn poll(self: *Self, scratch: sphtud.alloc.LinearAllocator, in_event_id: usize) !void {
             sw: switch (in_event_id) {
                 ids.auth_accept => {
@@ -72,30 +73,27 @@ pub fn AuthServer(comptime ids: EventIdList) type {
                     const id = event_id - ids.auth_connection.start;
 
                     const conn = self.connections.get(id);
-                    const cp = scratch.checkpoint();
-                    while (true) {
-                        defer scratch.restore(cp);
 
-                        conn.poll(scratch) catch |e| {
-                            if (conn.http.isWouldBlock2(e)) continue;
-                            if (e == error.EndOfStream) {
-                                try self.loop.unregister(conn.http.stream.handle);
-                                conn.http.deinit();
-                                self.connections.release(self.expansion, id);
-                                break;
-                            }
-                            return e;
-                        };
+                    switch (conn.poll(scratch)) {
+                        .wait => return,
+                        .close => try self.releaseConnection(id),
                     }
                 },
                 else => unreachable,
             }
         }
+
+        fn releaseConnection(self: *Self, id: usize) !void {
+            const conn = self.connections.get(id);
+            try self.loop.unregister(conn.http.stream.handle);
+            conn.http.deinit();
+            self.connections.release(self.expansion, id);
+        }
     };
 }
 
 pub const EventIdList = struct {
-    auth_accept: usize,
+    auth_accept: comptime_int,
     auth_connection: EventIdIter.Range,
 
     start: comptime_int,
@@ -117,14 +115,63 @@ const index_html = @embedFile("res/index.html");
 const Connection = struct {
     http: http.HttpServerConnection(4096, 4096),
 
+    // Generated HTTP readers write into this buffer, needs to survive across polls
+    poll_buf: [4096]u8 = undefined,
+
+    // HTTP body streams here, our auth server expects relatively small
+    // messages, so this is fine
+    content_buf: [16384]u8 = undefined,
+    content_writer: std.Io.Writer,
+
+    state: union(enum) {
+        default,
+        auth_body: *std.Io.Reader,
+    },
+
     fn initPinned(self: *Connection, stream: std.net.Stream) void {
         self.http.initPinned(stream);
+        self.content_writer = std.Io.Writer.fixed(&self.content_buf);
+        self.state = .default;
     }
 
-    // FIXME: Catch return 500
-    fn poll(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
-        var body_buf: [4096]u8 = undefined;
-        const req = try self.http.poll(scratch.allocator(), &body_buf);
+    const PollResponse = enum {
+        wait,
+        close,
+    };
+
+    fn poll(self: *Connection, scratch: sphtud.alloc.LinearAllocator) PollResponse {
+        const cp = scratch.checkpoint();
+        while (true) {
+            defer scratch.restore(cp);
+
+            self.pollInner(scratch) catch |e| {
+                // FIXME: It feels like this isn't our responsibility
+                if (self.http.isWouldBlock2(e)) return .wait;
+                if (e == error.EndOfStream) return .close;
+
+                // FIXME: Someone up here needs to return 500, but only if we
+                // haven't started writing another status
+                std.log.err("Auth connection failure {t}, closing\n", .{e});
+
+                // FIXME: Maybe all errors aren't recoverable, we need to
+                // evaluate the types of errors that can occur downstream
+                return .close;
+            };
+        }
+    }
+
+    fn pollInner(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
+        switch (self.state) {
+            .default => try self.pollDefault(scratch.allocator()),
+            .auth_body => |r| try self.pollAuthBody(scratch.allocator(), r),
+        }
+    }
+
+    fn pollDefault(self: *Connection, scratch: std.mem.Allocator) !void {
+
+        // FIXME: Close connection if body has been read and last header indicated we should close
+
+        const req = try self.http.poll(scratch, &self.poll_buf);
 
         std.debug.print("{s}\n", .{req.header.target});
 
@@ -151,22 +198,32 @@ const Connection = struct {
                 try self.http.writer.interface.flush();
             },
             .auth => {
-                const AuthResponse = struct {
-                    access_token: []const u8,
-                    state: []const u8,
-                };
-
-                var json_reader = std.json.Reader.init(scratch.allocator(), req.body_reader);
-
-                // FIXME: Will fall over if entire body buffer is not in req
-                const auth_response = try std.json.parseFromTokenSourceLeaky(AuthResponse, scratch.allocator(), &json_reader, .{
-                    .ignore_unknown_fields = true,
-                });
-
-                std.debug.print("Got auth response {any}\n", .{auth_response});
-                //try self.parent.event_sub_reg_state.setOauthKey(auth_response.access_token, auth_response.state);
-            },
+                self.content_writer.end = 0;
+                self.state = .{ .auth_body = req.body_reader };
+            }
         }
+    }
+
+    fn pollAuthBody(self: *Connection, scratch: std.mem.Allocator, r: *std.Io.Reader) !void {
+        _ = try r.streamRemaining(&self.content_writer);
+
+        self.state = .default;
+
+        const AuthResponse = struct {
+            access_token: []const u8,
+            state: []const u8,
+        };
+
+        // FIXME: Will fall over if entire body buffer is not in req
+        const auth_response = std.json.parseFromSliceLeaky(AuthResponse, scratch, self.content_writer.buffered(), .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            std.debug.print("Unexpected auth: {s}\n", .{self.content_writer.buffered()});
+            return;
+        };
+
+        std.debug.print("Got auth response {any}\n", .{auth_response});
+        //try self.parent.event_sub_reg_state.setOauthKey(auth_response.access_token, auth_response.state);
     }
 
     const RelevantParams = struct {

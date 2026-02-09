@@ -247,7 +247,6 @@ fn isWouldBlock(r: *std.net.Stream.Reader, e: anyerror) bool {
 //
 const EventSubRegisterState = struct {
     alloc: std.mem.Allocator,
-    scratch: std.mem.Allocator,
 
     websocket_id: ?[]const u8,
     oauth_key: ?[]const u8,
@@ -255,8 +254,8 @@ const EventSubRegisterState = struct {
 
     fn setWsId(self: *EventSubRegisterState, id: []const u8) !void {
         std.debug.assert(self.websocket_id == null);
-        self.websocket_id = try self.alloc.dupe(id);
-        self.maybeRegisterSocket();
+        self.websocket_id = try self.alloc.dupe(u8, id);
+        try self.maybeRegisterSocket();
     }
 
     fn setOauthKey(self: *EventSubRegisterState, key: []const u8, state: []const u8) !void {
@@ -269,9 +268,12 @@ const EventSubRegisterState = struct {
     }
 
     fn maybeRegisterSocket(self: *EventSubRegisterState) !void {
-        _ = self;
-        //const ws_id = self.websocket_id orelse return;
-        //const oauth_key = self.oauth_key orelse return;
+        const ws_id = self.websocket_id orelse return;
+        const oauth_key = self.oauth_key orelse return;
+        _ = ws_id;
+        _ = oauth_key;
+
+        std.debug.print("Have WS ID and key\n", .{});
 
         //const chat_id = "51219542";
         //const bot_id = "51219542";
@@ -298,19 +300,20 @@ const EventSubWs = struct {
         message: *std.Io.Reader,
     },
 
-    event_sub_ws: *EventSubRegisterState,
+    event_sub_reg_state: *EventSubRegisterState,
 
     // We are expecting to have 1, mayyyybe 2 websockets for the whole app, so
     // we can just shove our entire message content in here for now
     const max_message_size = 512 * 1024;
 
-    pub fn initPinned(self: *EventSubWs, scratch: std.mem.Allocator, ca_bundle: std.crypto.Certificate.Bundle, uri_meta: sphws.UriMetadata, random: std.Random) !void {
+    pub fn initPinned(self: *EventSubWs, scratch: std.mem.Allocator, ca_bundle: std.crypto.Certificate.Bundle, uri_meta: sphws.UriMetadata, random: std.Random, event_sub_reg_state: *EventSubRegisterState) !void {
         try self.conn.initPinned(scratch, ca_bundle, uri_meta);
         self.ws = try sphws.Websocket.init(&self.conn.tls_client.reader, &self.conn.tls_client.writer, uri_meta.host, uri_meta.path, random);
         try self.conn.flush();
         self.message_content.writer = std.Io.Writer.fixed(&self.message_content.buf);
         self.scratch = scratch;
         self.state = .default;
+        self.event_sub_reg_state = event_sub_reg_state;
     }
 
     fn poll(self: *EventSubWs) !noreturn {
@@ -330,12 +333,47 @@ const EventSubWs = struct {
             },
         };
 
+        // FIXME: These types need to live somewhere else
+        const MessageType = enum {
+            session_welcome,
+            notification
+        };
+
         _ = try data.streamRemaining(&self.message_content.writer);
 
-        // FIXME: We probably actually want to reset the scratch allocator here
-        const message = try std.json.parseFromSliceLeaky(CommonMessage, self.scratch, self.message_content.writer.buffered(), .{ .ignore_unknown_fields = true });
-        std.debug.print("Received message: {any}\n", .{message});
         self.state = .default;
+
+        // FIXME: We probably actually want to reset the scratch allocator here
+        const message = std.json.parseFromSliceLeaky(CommonMessage, self.scratch, self.message_content.writer.buffered(), .{ .ignore_unknown_fields = true }) catch {
+            std.log.err("Invalid json message: {s}\n", .{self.message_content.writer.buffered()});
+            return;
+        };
+
+
+        std.debug.print("Received message: {any}\n", .{message});
+
+        const message_type = std.meta.stringToEnum(MessageType, message.metadata.message_type) orelse return;
+        switch (message_type) {
+            .session_welcome => {
+                const SessionWelcome = struct {
+                    payload: struct {
+                        session: struct {
+                            id: []const u8,
+                            keepalive_timeout_seconds: u32,
+                        },
+                    },
+                };
+
+                const welcome = std.json.parseFromSliceLeaky(SessionWelcome, self.scratch, self.message_content.writer.buffered(), .{ .ignore_unknown_fields = true }) catch {
+                    std.log.err("Invalid welcome message: {s}\n", .{self.message_content.writer.buffered()});
+                    return;
+                };
+
+                std.debug.print("Setting websocket id: {s}\n", .{welcome.payload.session.id});
+                try self.event_sub_reg_state.setWsId(welcome.payload.session.id);
+            },
+            .notification => {},
+        }
     }
 
     fn pollDefault(self: *EventSubWs) !void {
@@ -404,8 +442,10 @@ const EventSubWs = struct {
 //    };
 //}
 
+const id_list = EventIdList.generate();
+
 pub fn main() !void {
-    const id_list = EventIdList.generate();
+    std.debug.print("{any}\n", .{id_list});
 
     var alloc_buf: [4 * 1024 * 1024]u8 = undefined;
     var ba = sphtud.alloc.BufAllocator.init(&alloc_buf);
@@ -426,9 +466,18 @@ pub fn main() !void {
     try std.posix.getrandom(std.mem.asBytes(&seed));
     var rng = std.Random.DefaultPrng.init(seed);
 
+    // FIXME: I feel like this should be completely nuked after registration is
+    // complete. Surely there's some union somewhere
+    var event_sub_register_state = EventSubRegisterState {
+        .oauth_key = null,
+        .websocket_id = null,
+        .alloc = alloc,
+        .state = "1234",
+    };
+
     const uri_meta = try sphws.UriMetadata.fromString(alloc, "wss://eventsub.wss.twitch.tv/ws");
     var event_sub_ws: EventSubWs = undefined;
-    try event_sub_ws.initPinned(scratch.allocator(), ca_bundle, uri_meta, rng.random());
+    try event_sub_ws.initPinned(scratch.allocator(), ca_bundle, uri_meta, rng.random(), &event_sub_register_state);
 
     try sphtud.event.setNonblock(event_sub_ws.conn.stream.handle);
 
