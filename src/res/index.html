@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<script>
+			async function init() {
+				const params = new URLSearchParams(document.location.hash.substring(1));
+				console.log(params.get("access_token"));
+				console.log(params.get("state"));
+
+				await fetch(window.location.origin + "/auth", {
+					method: "POST",
+					body: JSON.stringify({
+						state: params.get("state"),
+						access_token: params.get("access_token"),
+					})
+				});
+
+				window.close();
+			}
+			init();
+		</script>
+	</head>
+	<body>
+	</body>
+</html>
