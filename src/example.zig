@@ -6,16 +6,14 @@ const EventIdIter = @import("EventIdIter.zig");
 const as = @import("auth_server.zig");
 
 const EventIdList = struct {
-    auth: EventIdIter.Range,
+    auth: as.EventIdList,
     websocket: comptime_int,
 
-    const max_auth_connections = 100;
-    const max_fetches = 100;
-
-    pub fn generate(id: *EventIdIter, auth: as.EventIdList) EventIdList {
+    pub fn generate() EventIdList {
+        var id_iter = EventIdIter{};
         return .{
-            .auth = auth.total_range,
-            .websocket = id.one(),
+            .auth = as.EventIdList.generate(&id_iter),
+            .websocket = id_iter.one(),
         };
     }
 };
@@ -407,9 +405,7 @@ const EventSubWs = struct {
 //}
 
 pub fn main() !void {
-    comptime var id_iter = EventIdIter{};
-    const auth_ids = comptime as.EventIdList.generate(&id_iter);
-    const event_id = comptime EventIdList.generate(&id_iter, auth_ids);
+    const id_list = EventIdList.generate();
 
     var alloc_buf: [4 * 1024 * 1024]u8 = undefined;
     var ba = sphtud.alloc.BufAllocator.init(&alloc_buf);
@@ -420,7 +416,7 @@ pub fn main() !void {
 
     var loop = try sphtud.event.Loop2.init();
 
-    var auth_server = try as.AuthServer(auth_ids).init(&loop, alloc, expansion);
+    var auth_server = try as.AuthServer(id_list.auth).init(&loop, alloc, expansion);
 
     var ca_bundle = std.crypto.Certificate.Bundle{};
     // FIXME: LOL GPA please
@@ -438,7 +434,7 @@ pub fn main() !void {
 
     try loop.register(.{
         .handle = event_sub_ws.conn.stream.handle,
-        .id = event_id.websocket,
+        .id = id_list.websocket,
         .read = true,
         .write = false,
     });
@@ -446,10 +442,10 @@ pub fn main() !void {
     while (true) {
         const event = try loop.poll();
         switch (event) {
-            event_id.auth.start...event_id.auth.end => {
+            id_list.auth.start...id_list.auth.end => {
                 try auth_server.poll(scratch, event);
             },
-            event_id.websocket => {
+            id_list.websocket => {
                 event_sub_ws.poll() catch |e| {
                     if (isWouldBlock(&event_sub_ws.conn.stream_reader, e)) continue;
                     return e;

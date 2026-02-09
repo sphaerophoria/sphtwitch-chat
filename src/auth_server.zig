@@ -97,15 +97,16 @@ pub fn AuthServer(comptime ids: EventIdList) type {
 pub const EventIdList = struct {
     auth_accept: usize,
     auth_connection: EventIdIter.Range,
-    total_range: EventIdIter.Range,
+
+    start: comptime_int,
+    end: comptime_int,
 
     pub fn generate(it: *EventIdIter) EventIdList {
-        const total_start = it.markStart();
-
         return .{
+            .start = it.markStart(),
             .auth_accept = it.one(),
             .auth_connection = it.many(max_auth_connections),
-            .total_range = total_start.markEnd(),
+            .end = it.markEnd(),
         };
     }
 };

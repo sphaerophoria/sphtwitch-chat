@@ -7,23 +7,12 @@ id: comptime_int = 0,
 // Note that start..end is inclusive for easier usage in switch statements
 pub const Range = struct { start: comptime_int, end: comptime_int };
 
-pub const TotalRange = struct {
-    start: comptime_int,
-    parent: *EventIdIter,
+pub fn markStart(self: *EventIdIter) comptime_int {
+    return self.id;
+}
 
-    pub fn markEnd(self: TotalRange) Range {
-        return .{
-            .start = self.start,
-            .end = self.parent.id - 1,
-        };
-    }
-};
-
-pub fn markStart(self: *EventIdIter) TotalRange {
-    return .{
-        .start = self.id,
-        .parent = self,
-    };
+pub fn markEnd(self: *EventIdIter) comptime_int {
+    return self.id - 1;
 }
 
 pub fn one(self: *EventIdIter) comptime_int {
