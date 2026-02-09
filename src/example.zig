@@ -9,12 +9,27 @@ const event_sub = @import("event_sub.zig");
 const EventIdList = struct {
     auth: as.EventIdList,
     websocket: comptime_int,
+    fetch: http.Client.EventIdList,
 
     pub fn generate() EventIdList {
         var id_iter = EventIdIter{};
         return .{
             .auth = as.EventIdList.generate(&id_iter),
             .websocket = id_iter.one(),
+            .fetch = .generate(&id_iter),
+        };
+    }
+};
+
+const FetchIdList = struct {
+    register_state: event_sub.RegisterStateFetchIdList,
+    example: ExampleFetcher.FetchIdList,
+
+    pub fn generate() FetchIdList {
+        var id_iter = EventIdIter{};
+        return .{
+            .register_state = .generate(&id_iter),
+            .example = .generate(&id_iter),
         };
     }
 };
@@ -284,13 +299,92 @@ const EventIdList = struct {
 //    };
 //}
 
+const ExampleFetcher = struct {
+    example_1_state: usize,
+    example_2_state: usize,
+
+    pub const FetchIdList = struct {
+        start: comptime_int,
+        example: comptime_int,
+        example2: comptime_int,
+        end: comptime_int,
+
+        fn generate(id_it: *EventIdIter) ExampleFetcher.FetchIdList {
+            return .{
+                .start = id_it.markStart(),
+                .example = id_it.one(),
+                .example2 = id_it.one(),
+                .end = id_it.markStart(),
+            };
+        }
+    };
+
+    fn spawn(client: *http.Client, scratch: sphtud.alloc.LinearAllocator, comptime fetch_ids: ExampleFetcher.FetchIdList) !ExampleFetcher {
+        const cp = scratch.checkpoint();
+        defer scratch.restore(cp);
+
+        {
+            const conn = try client.fetch(scratch.allocator(), "example.com", 80, fetch_ids.example);
+
+            try conn.http_writer.startRequest(.{
+                .method = .GET,
+                .target = "/",
+                .content_length = 0,
+            });
+            try conn.http_writer.writeBody("");
+            try conn.writer.interface.flush();
+        }
+
+        {
+            const conn = try client.fetch(scratch.allocator(), "example.com", 80, fetch_ids.example2);
+
+            try conn.http_writer.startRequest(.{
+                .method = .GET,
+                .target = "/",
+                .content_length = 0,
+            });
+            try conn.http_writer.writeBody("");
+            try conn.writer.interface.flush();
+        }
+
+        return .{
+            .example_1_state = 5,
+            .example_2_state = 9,
+        };
+    }
+
+    // FetchIdList is confusing
+    //   * Strong type
+    fn pollFetch(self: *ExampleFetcher, scratch: sphtud.alloc.LinearAllocator, state: *http.Client.ConnectionState, comptime idl: ExampleFetcher.FetchIdList) !void {
+        var body_buf: [4096]u8 = undefined;
+        const res = state.connection.poll(scratch.allocator(), &body_buf) catch |e| {
+            if (e == error.EndOfStream) {
+                state.deinit();
+                return;
+            }
+            return e;
+        };
+        std.debug.print("Got response {t}\n", .{res.header.status});
+        switch (state.fetch_id) {
+            idl.example => {
+                std.debug.print("Associated with {d}\n", .{self.example_1_state});
+            },
+            idl.example2 => {
+                std.debug.print("Associated with {d}\n", .{self.example_2_state});
+            },
+            else => unreachable,
+        }
+
+    }
+};
+
 const id_list = EventIdList.generate();
+const fetch_id_list = FetchIdList.generate();
 
 pub fn main() !void {
     std.debug.print("{any}\n", .{id_list});
 
-    var alloc_buf: [4 * 1024 * 1024]u8 = undefined;
-    var ba = sphtud.alloc.BufAllocator.init(&alloc_buf);
+    var ba = sphtud.alloc.BufAllocator.init(try std.heap.page_allocator.alloc(u8, 10 * 1024 * 1024));
 
     const alloc = ba.allocator();
     const expansion = ba.expansion();
@@ -298,16 +392,30 @@ pub fn main() !void {
 
     var loop = try sphtud.event.Loop2.init();
 
+    // FIXME: This should be an init fn
+    var http_client = http.Client {
+        .base_id = id_list.fetch.start,
+        .loop = &loop,
+        .expansion = expansion,
+        .connections = try .init(
+            alloc,
+            expansion,
+            http.Client.max_connections,
+            http.Client.max_connections,
+        ),
+    };
+
     // FIXME: I feel like this should be completely nuked after registration is
     // complete. Surely there's some union somewhere
-    var es_state = event_sub.RegisterState {
+    var register_state = event_sub.RegisterState(fetch_id_list.register_state) {
         .oauth_key = null,
+        .http_client = &http_client,
         .websocket_id = null,
         .alloc = alloc,
         .state = "1234",
     };
 
-    var auth_server = try as.AuthServer(id_list.auth).init(&loop, alloc, expansion, &es_state);
+    var auth_server = try as.AuthServer(id_list.auth).init(&loop, alloc, expansion);
 
     var ca_bundle = std.crypto.Certificate.Bundle{};
     // FIXME: LOL GPA please
@@ -319,7 +427,7 @@ pub fn main() !void {
 
     const uri_meta = try sphws.UriMetadata.fromString(alloc, "wss://eventsub.wss.twitch.tv/ws");
     var event_sub_conn: event_sub.Connection = undefined;
-    try event_sub_conn.initPinned(scratch.allocator(), ca_bundle, uri_meta, rng.random(), &es_state);
+    try event_sub_conn.initPinned(scratch.allocator(), ca_bundle, uri_meta, rng.random());
     // FIXME: event_sub.Connection can probably be event loop aware which cuts
     // down on this clutter in main
     try sphtud.event.setNonblock(event_sub_conn.conn.stream.handle);
@@ -331,6 +439,8 @@ pub fn main() !void {
         .write = false,
     });
 
+    var example = try ExampleFetcher.spawn(&http_client, scratch, fetch_id_list.example);
+
     while (true) {
         const event = try loop.poll();
         switch (event) {
@@ -339,6 +449,21 @@ pub fn main() !void {
             },
             id_list.websocket => {
                 try event_sub_conn.poll(scratch);
+            },
+            id_list.fetch.start...id_list.fetch.end => {
+                const state = http_client.getState(event);
+
+                switch (state.fetch_id) {
+                    // Every single thing for the entire app gets mapped at the top level
+                    fetch_id_list.register_state.start...fetch_id_list.register_state.end => {
+                        try register_state.pollFetch(scratch, state);
+                    },
+                    fetch_id_list.example.start...fetch_id_list.example.end => {
+                        try example.pollFetch(scratch, state, fetch_id_list.example);
+                    },
+                    else => unreachable,
+                }
+
             },
             else => unreachable,
         }

@@ -10,14 +10,14 @@ pub fn AuthServer(comptime ids: EventIdList) type {
     return struct {
         serv: std.net.Server,
         connections: sphtud.util.ObjectPool(Connection, usize),
-        event_sub_reg_state: *event_sub.RegisterState,
+        //event_sub_reg_state: *event_sub.RegisterState,
 
         expansion: sphtud.util.ExpansionAlloc,
         loop: *sphtud.event.Loop2,
 
         const Self = @This();
 
-        pub fn init(loop: *sphtud.event.Loop2, alloc: std.mem.Allocator, expansion: sphtud.util.ExpansionAlloc, event_sub_reg_state: *event_sub.RegisterState) !Self {
+        pub fn init(loop: *sphtud.event.Loop2, alloc: std.mem.Allocator, expansion: sphtud.util.ExpansionAlloc) !Self {
             const address = std.net.Address.initIp4(.{0, 0, 0, 0}, 9342);
             const serv = try address.listen(.{
                 .reuse_address = true,
@@ -33,7 +33,7 @@ pub fn AuthServer(comptime ids: EventIdList) type {
 
             return .{
                 .serv = serv,
-                .event_sub_reg_state = event_sub_reg_state,
+                //.event_sub_reg_state = event_sub_reg_state,
                 .connections = try .init(
                     alloc,
                     expansion,
@@ -209,6 +209,7 @@ const Connection = struct {
 
     fn pollAuthBody(self: *Connection, scratch: std.mem.Allocator, r: *std.Io.Reader, parent: anytype) !void {
         _ = try r.streamRemaining(&self.content_writer);
+        _ = parent;
 
         self.state = .default;
 
@@ -226,7 +227,7 @@ const Connection = struct {
         };
 
         std.debug.print("Got auth response {any}\n", .{auth_response});
-        try parent.event_sub_reg_state.setOauthKey(auth_response.access_token, auth_response.state);
+        //try parent.event_sub_reg_state.setOauthKey(auth_response.access_token, auth_response.state);
     }
 
     const RelevantParams = struct {
