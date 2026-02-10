@@ -1,109 +1,89 @@
- const std = @import("std");
- const sphtud = @import("sphtud");
- const EventIdIter = @import("EventIdIter.zig");
-// FIXME: This surely will come up a lot, move into sphtud
-fn isWouldBlock(r: *std.net.Stream.Reader, e: anyerror) bool {
-    switch (e) {
-        error.ReadFailed => {
-            const se = r.getError() orelse return false;
-            switch (se) {
-                error.WouldBlock => return true,
-                else => {},
-            }
-        },
-        else => {},
-    }
-
-    return false;
-}
-
+const std = @import("std");
+const sphtud = @import("sphtud");
+const EventIdIter = @import("EventIdIter.zig");
 
 // FIXME: Move to sphtud.http
 // Connection for an http server, not to an http server
 pub fn HttpServerConnection(comptime read_size: usize, comptime write_size: usize) type {
     return struct {
-        stream: std.net.Stream,
-
-        reader_buf: [read_size]u8,
-        writer_buf: [write_size]u8,
-
-        reader: std.net.Stream.Reader,
-        writer: std.net.Stream.Writer,
+        stream: sphtud.net.Stream(read_size, write_size),
 
         http_reader: sphtud.http.HttpRequestReader,
         http_writer: sphtud.http.HttpWriter,
 
         pub fn initPinned(self: *@This(), stream: std.net.Stream) void {
-            self.stream = stream;
+            self.stream.fromStd(stream);
 
-            self.reader = self.stream.reader(&self.reader_buf);
-            self.writer = self.stream.writer(&self.writer_buf);
-
-            self.http_reader = .init(self.reader.interface());
-            self.http_writer = .init(&self.writer.interface);
+            self.http_reader = .init(self.stream.reader());
+            self.http_writer = .init(self.stream.writer());
         }
 
         pub fn deinit(self: *@This()) void {
-            self.stream.close();
+            self.stream.stream.close();
         }
 
         pub fn poll(self: *@This(), alloc: std.mem.Allocator, body_buf: []u8) !sphtud.http.HttpRequestReader.Result {
             return self.http_reader.poll(alloc, body_buf);
         }
 
-        // FIXME: name
-        pub fn isWouldBlock2(self: *@This(), e: anyerror) bool {
-            return isWouldBlock(&self.reader, e);
+        pub fn isWouldBlock(self: *@This(), e: anyerror) bool {
+            return self.stream.isWouldBlock(e);
         }
     };
 }
 
-fn HttpClientConnection(comptime read_size: usize, comptime write_size: usize) type {
+fn HttpsClientConnection(comptime read_size: usize, comptime write_size: usize) type {
     return struct {
-        stream: std.net.Stream,
-
-        reader_buf: [read_size]u8,
-        writer_buf: [write_size]u8,
-
-        reader: std.net.Stream.Reader,
-        writer: std.net.Stream.Writer,
+        tls: sphtud.net.TlsStream(read_size, write_size),
 
         http_reader: sphtud.http.HttpResponseReader,
         http_writer: sphtud.http.HttpWriter,
 
-        pub fn initPinned(self: *@This(), stream: std.net.Stream) void {
-            self.stream = stream;
+        pub fn initPinned(self: *@This(), ca_bundle: std.crypto.Certificate.Bundle, host: []const u8, stream: std.net.Stream) !void {
+            try self.tls.initPinned(stream, host, ca_bundle);
 
-            self.reader = self.stream.reader(&self.reader_buf);
-            self.writer = self.stream.writer(&self.writer_buf);
+            self.http_reader = .init(self.tls.reader());
+            self.http_writer = .init(self.tls.writer());
+        }
 
-            self.http_reader = .init(self.reader.interface());
-            self.http_writer = .init(&self.writer.interface);
+        pub fn flush(self: *@This()) !void {
+            try self.tls.flush();
         }
 
         pub fn deinit(self: *@This()) void {
-            self.stream.close();
+            self.tls.close();
         }
 
         pub fn poll(self: *@This(), alloc: std.mem.Allocator, body_buf: []u8) !sphtud.http.HttpResponseReader.Result {
             return self.http_reader.poll(alloc, body_buf);
         }
 
-        // FIXME: name
-        pub fn isWouldBlock2(self: *@This(), e: anyerror) bool {
-            return isWouldBlock(&self.reader, e);
+        pub fn isWouldBlock(self: *@This(), e: anyerror) bool {
+            return self.tls.isWouldBlock(e);
         }
     };
 }
 
-
-// IDS 100-200 are for http fetches,
 pub const Client = struct {
-    connections: sphtud.util.ObjectPool(ConnectionState, usize),
-    expansion: sphtud.util.ExpansionAlloc,
-    base_id: usize,
+    connections: Pool,
 
     loop: *sphtud.event.Loop2,
+    ca_bundle: *std.crypto.Certificate.Bundle,
+
+    pub const FetchHandle = struct {
+        inner: usize,
+
+        pub fn fromIdx(idx: usize) FetchHandle {
+            return .{ .inner = idx };
+        }
+
+        pub fn toIdx(self: FetchHandle) usize {
+            return self.inner;
+        }
+    };
+
+    const Pool = sphtud.util.ObjectPool(HttpsClientConnection(4096, 4096), FetchHandle);
+    const WithHandle = Pool.WithHandle;
 
     pub const max_connections = 100;
 
@@ -123,51 +103,52 @@ pub const Client = struct {
         }
     };
 
-    pub const ConnectionState = struct {
-        fetch_id: usize,
-        connection: HttpClientConnection(4096, 4096),
+    pub fn init(
+        loop: *sphtud.event.Loop2,
+        arena: std.mem.Allocator,
+        ca_bundle: *std.crypto.Certificate.Bundle,
+    ) !Client {
+        return .{
+            .loop = loop,
+            .connections = try .init(
+                arena,
+                .invalid,
+                max_connections,
+                max_connections,
+            ),
+            .ca_bundle = ca_bundle,
+        };
+    }
 
-        // FIXME: Clearly this shouldn't be here
-        index: usize,
-        parent: *Client,
-
-        pub fn deinit(self: *ConnectionState) void {
-            self.parent.release(self);
-        }
-    };
-
-    pub fn fetch(self: *Client, scratch: std.mem.Allocator, host: []const u8, port: u16, fetch_id: usize) !*HttpClientConnection(4096, 4096) {
+    pub fn fetch(self: *Client, scratch: std.mem.Allocator, host: []const u8, port: u16, event_id: usize) !WithHandle {
         const stream = try std.net.tcpConnectToHost(scratch, host, port);
 
-        const handle = try self.connections.acquire(self.expansion);
-        handle.val.connection.initPinned(stream);
-        handle.val.fetch_id = fetch_id;
+        // FIXME: TLS handshaking should be done in it's own thread
+        const handle = try self.connections.acquire(.invalid);
+        try handle.val.initPinned(self.ca_bundle.*, host, stream);
 
-        // FIXME: lol this is stupid
-        handle.val.index = handle.handle;
-        handle.val.parent = self;
+        try sphtud.event.setNonblock(stream.handle);
 
         try self.loop.register(.{
-            .handle = handle.val.connection.stream.handle,
-            .id = self.base_id + handle.handle,
+            .handle = handle.val.tls.handle(),
+            .id = event_id,
             .read = true,
             .write = false,
         });
 
-        return &handle.val.connection;
+        return handle;
     }
 
-    pub fn release(self: *Client, state: *ConnectionState) void {
-        self.loop.unregister(state.connection.stream.handle) catch {
+    pub fn release(self: *Client, handle: FetchHandle) void {
+        const connection = self.connections.get(handle);
+        self.loop.unregister(connection.tls.handle()) catch {
             std.log.err("Failed to remove from epoll\n", .{});
         };
-        state.connection.deinit();
-        self.connections.release(self.expansion, state.index);
+        connection.deinit();
+        self.connections.release(.invalid, handle);
     }
 
-    pub fn getState(self: *Client, event: usize) *ConnectionState {
-        const connection_id = event - self.base_id;
-        return self.connections.get(connection_id);
+    pub fn get(self: *Client, handle: FetchHandle) *HttpsClientConnection(4096, 4096) {
+        return self.connections.get(handle);
     }
-
 };

@@ -2,17 +2,13 @@ const std = @import("std");
 const sphws = @import("sphws");
 const sphtud = @import("sphtud");
 
-
-const CommonMessage  = struct {
+const CommonMessage = struct {
     metadata: struct {
         message_type: []const u8,
     },
 };
 
-const MessageType = enum {
-    session_welcome,
-    notification
-};
+const MessageType = enum { session_welcome, notification };
 
 const SessionWelcome = struct {
     payload: struct {
@@ -34,7 +30,7 @@ const ChatMessageEvent = struct {
 const Notification = struct {
     payload: struct {
         subscription: struct {
-            @"type": []const u8,
+            type: []const u8,
         },
         event: std.json.Value,
     },
@@ -107,27 +103,16 @@ const Notification = struct {
 //  }
 //}
 
-
 fn registerForChat(scratch: std.mem.Allocator, client: *std.http.Client, welcome_message: SessionWelcome, client_id: []const u8, secret: []const u8, chat_id: []const u8, bot_id: []const u8) !void {
-
     const bear_string = try std.fmt.allocPrint(scratch, "Bearer {s}", .{secret});
 
-    const RegisterMesage = struct {
-        @"type": []const u8,
-        version: []const u8,
-        condition: struct {
-                broadcaster_user_id: []const u8,
-                user_id: []const u8
-        },
-        transport: struct {
-                method: []const u8,
-                session_id: []const u8,
-        }
-    };
+    const RegisterMesage = struct { type: []const u8, version: []const u8, condition: struct { broadcaster_user_id: []const u8, user_id: []const u8 }, transport: struct {
+        method: []const u8,
+        session_id: []const u8,
+    } };
 
-
-    const post_body = try std.json.Stringify.valueAlloc(scratch, RegisterMesage {
-        .@"type" = "channel.chat.message",
+    const post_body = try std.json.Stringify.valueAlloc(scratch, RegisterMesage{
+        .type = "channel.chat.message",
         .version = "1",
         .condition = .{
             .broadcaster_user_id = chat_id,
@@ -137,9 +122,7 @@ fn registerForChat(scratch: std.mem.Allocator, client: *std.http.Client, welcome
             .method = "websocket",
             .session_id = welcome_message.payload.session.id,
         },
-
     }, .{ .whitespace = .indent_2 });
-
 
     var response_writer = std.Io.Writer.Allocating.init(scratch);
 
@@ -161,11 +144,9 @@ fn registerForChat(scratch: std.mem.Allocator, client: *std.http.Client, welcome
         .payload = post_body,
     });
 
-
     std.debug.print("status: {d}\n", .{response.status});
     std.debug.print("body: {s}\n", .{response_writer.written()});
 }
-
 
 //{"metadata":{"message_id":"aeb3ba8b-7595-46fb-817e-c685a878f0e4","message_type":"session_welcome","message_timestamp":"2026-02-01T22:19:28.109022754Z"},"payload":{"session":{"id":"AgoQqRwUUsmySNezH4ZTJ8KsuxIGY2VsbC1h","status":"connected","connected_at":"2026-02-01T22:19:28.104472057Z","keepalive_timeout_seconds":10,"reconnect_url":null,"recovery_url":null}}}
 pub fn main() !void {
@@ -185,7 +166,7 @@ pub fn main() !void {
     try std.posix.getrandom(std.mem.asBytes(&seed));
     var rng = std.Random.DefaultPrng.init(seed);
 
-    var http_client = std.http.Client {
+    var http_client = std.http.Client{
         .allocator = gpa.allocator(),
     };
 
@@ -239,20 +220,20 @@ pub fn main() !void {
             .message => |f| {
                 const data = try f.data.allocRemaining(scratch.allocator(), .unlimited);
 
-                const common = try std.json.parseFromSliceLeaky(CommonMessage, scratch.allocator(), data, .{.ignore_unknown_fields = true});
+                const common = try std.json.parseFromSliceLeaky(CommonMessage, scratch.allocator(), data, .{ .ignore_unknown_fields = true });
 
                 const message_type = std.meta.stringToEnum(MessageType, common.metadata.message_type) orelse continue;
                 switch (message_type) {
                     .session_welcome => {
-                        const welcome_message = try std.json.parseFromSliceLeaky(SessionWelcome, scratch.allocator(), data, .{.ignore_unknown_fields = true});
+                        const welcome_message = try std.json.parseFromSliceLeaky(SessionWelcome, scratch.allocator(), data, .{ .ignore_unknown_fields = true });
                         try registerForChat(scratch.allocator(), &http_client, welcome_message, client_id, secret, chat_id, bot_id);
                     },
                     .notification => {
-                        const notification = try std.json.parseFromSliceLeaky(Notification, scratch.allocator(), data, .{.ignore_unknown_fields = true});
-                        if (!std.mem.eql(u8, "channel.chat.message", notification.payload.subscription.@"type")) continue;
+                        const notification = try std.json.parseFromSliceLeaky(Notification, scratch.allocator(), data, .{ .ignore_unknown_fields = true });
+                        if (!std.mem.eql(u8, "channel.chat.message", notification.payload.subscription.type)) continue;
 
                         const chat_message = try std.json.parseFromValueLeaky(ChatMessageEvent, scratch.allocator(), notification.payload.event, .{ .ignore_unknown_fields = true });
-                        std.debug.print("{s}: {s}\n", .{chat_message.chatter_user_name, chat_message.message.text});
+                        std.debug.print("{s}: {s}\n", .{ chat_message.chatter_user_name, chat_message.message.text });
                     },
                 }
             },

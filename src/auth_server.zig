@@ -6,19 +6,33 @@ const event_sub = @import("event_sub.zig");
 
 const max_auth_connections = 100;
 
+const OauthState = [16]u8;
+
 pub fn AuthServer(comptime ids: EventIdList) type {
     return struct {
         serv: std.net.Server,
+        // FIXME: Basically no one will ever be here, one connection is good enough
         connections: sphtud.util.ObjectPool(Connection, usize),
-        //event_sub_reg_state: *event_sub.RegisterState,
+        event_sub_reg_state: *event_sub.RegisterState,
 
-        expansion: sphtud.util.ExpansionAlloc,
+        oauth_state: OauthState,
+
         loop: *sphtud.event.Loop2,
+
+        const expansion_alloc = sphtud.util.ExpansionAlloc.invalid;
 
         const Self = @This();
 
-        pub fn init(loop: *sphtud.event.Loop2, alloc: std.mem.Allocator, expansion: sphtud.util.ExpansionAlloc) !Self {
-            const address = std.net.Address.initIp4(.{0, 0, 0, 0}, 9342);
+        pub fn init(loop: *sphtud.event.Loop2, alloc: std.mem.Allocator, event_sub_reg_state: *event_sub.RegisterState, rand: std.Random, client_id: []const u8) !Self {
+
+            const oauth_state = generateOauthState(rand);
+
+            // FIXME: At some point this probably needs to re-attmept to auth
+            // if we lose auth or something, so this shoiuldn't live here. but
+            // for now it's ok probably maybe
+            printAuthUrl(client_id, &oauth_state);
+
+            const address = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 3000);
             const serv = try address.listen(.{
                 .reuse_address = true,
             });
@@ -33,64 +47,69 @@ pub fn AuthServer(comptime ids: EventIdList) type {
 
             return .{
                 .serv = serv,
-                //.event_sub_reg_state = event_sub_reg_state,
+                .event_sub_reg_state = event_sub_reg_state,
                 .connections = try .init(
                     alloc,
-                    expansion,
-                    max_auth_connections,
+                    expansion_alloc,
+                    // The vast majority of the time no one will be here
+                    8,
                     max_auth_connections,
                 ),
-                .expansion = expansion,
+                .oauth_state = oauth_state,
                 .loop = loop,
             };
         }
 
         // FIXME: Error return type should be well defined here
         pub fn poll(self: *Self, scratch: sphtud.alloc.LinearAllocator, in_event_id: usize) !void {
-            sw: switch (in_event_id) {
-                ids.auth_accept => {
-                    while (true) {
-                        const conn = self.serv.accept() catch |e| {
-                            if (e == error.WouldBlock) break;
-                            return e;
-                        };
-
-                        try sphtud.event.setNonblock(conn.stream.handle);
-
-                        const stored = try self.connections.acquire(self.expansion);
-                        stored.val.initPinned(conn.stream);
-
-                        const conn_id = ids.auth_connection.start + stored.handle;
-
-                        try self.loop.register(.{
-                            .id = conn_id,
-                            .handle = conn.stream.handle,
-                            .read = true,
-                            .write = false,
-                        });
-
-                        continue :sw conn_id;
-                    }
-                },
+            switch (in_event_id) {
+                ids.auth_accept => try self.pollAccept(scratch),
                 ids.auth_connection.start...ids.auth_connection.end => |event_id| {
-                    const id = event_id - ids.auth_connection.start;
-
-                    const conn = self.connections.get(id);
-
-                    switch (conn.poll(scratch, self)) {
-                        .wait => return,
-                        .close => try self.releaseConnection(id),
-                    }
+                    try self.pollConnection(scratch, event_id - ids.auth_connection.start);
                 },
                 else => unreachable,
             }
         }
 
+        fn pollAccept(self: *Self, scratch: sphtud.alloc.LinearAllocator) !void {
+            while (true) {
+                const conn = self.serv.accept() catch |e| {
+                    if (e == error.WouldBlock) break;
+                    return e;
+                };
+
+                try sphtud.event.setNonblock(conn.stream.handle);
+
+                const stored = try self.connections.acquire(expansion_alloc);
+                stored.val.initPinned(conn.stream);
+
+                const event_id = ids.auth_connection.start + stored.handle;
+
+                try self.loop.register(.{
+                    .id = event_id,
+                    .handle = conn.stream.handle,
+                    .read = true,
+                    .write = false,
+                });
+
+                try self.pollConnection(scratch, stored.handle);
+            }
+        }
+
+        fn pollConnection(self: *Self, scratch: sphtud.alloc.LinearAllocator, conn_id: usize) !void {
+            const conn = self.connections.get(conn_id);
+
+            switch (conn.poll(scratch, self)) {
+                .wait => return,
+                .close => try self.releaseConnection(conn_id),
+            }
+        }
+
         fn releaseConnection(self: *Self, id: usize) !void {
             const conn = self.connections.get(id);
-            try self.loop.unregister(conn.http.stream.handle);
+            try self.loop.unregister(conn.http.stream.stream.handle);
             conn.http.deinit();
-            self.connections.release(self.expansion, id);
+            self.connections.release(expansion_alloc, id);
         }
     };
 }
@@ -111,7 +130,6 @@ pub const EventIdList = struct {
         };
     }
 };
-
 
 const index_html = @embedFile("res/index.html");
 
@@ -149,7 +167,7 @@ const Connection = struct {
 
             self.pollInner(scratch, parent) catch |e| {
                 // FIXME: It feels like this isn't our responsibility
-                if (self.http.isWouldBlock2(e)) return .wait;
+                if (self.http.isWouldBlock(e)) return .wait;
                 if (e == error.EndOfStream) return .close;
 
                 // FIXME: Someone up here needs to return 500, but only if we
@@ -166,7 +184,7 @@ const Connection = struct {
     fn pollInner(self: *Connection, scratch: sphtud.alloc.LinearAllocator, parent: anytype) !void {
         switch (self.state) {
             .default => try self.pollDefault(scratch.allocator()),
-            .auth_body => |r| try self.pollAuthBody(scratch.allocator(), r, parent),
+            .auth_body => |r| try self.pollAuthBody(scratch, r, parent),
         }
     }
 
@@ -184,7 +202,7 @@ const Connection = struct {
                 .status = .not_found,
             });
             try self.http.http_writer.writeBody("");
-            try self.http.writer.interface.flush();
+            try self.http.stream.flush();
             return;
         };
 
@@ -198,18 +216,17 @@ const Connection = struct {
                     .content_type = "text/html",
                 });
                 try self.http.http_writer.writeBody(index_html);
-                try self.http.writer.interface.flush();
+                try self.http.stream.flush();
             },
             .auth => {
                 self.content_writer.end = 0;
                 self.state = .{ .auth_body = req.body_reader };
-            }
+            },
         }
     }
 
-    fn pollAuthBody(self: *Connection, scratch: std.mem.Allocator, r: *std.Io.Reader, parent: anytype) !void {
+    fn pollAuthBody(self: *Connection, scratch: sphtud.alloc.LinearAllocator, r: *std.Io.Reader, parent: anytype) !void {
         _ = try r.streamRemaining(&self.content_writer);
-        _ = parent;
 
         self.state = .default;
 
@@ -219,15 +236,26 @@ const Connection = struct {
         };
 
         // FIXME: Will fall over if entire body buffer is not in req
-        const auth_response = std.json.parseFromSliceLeaky(AuthResponse, scratch, self.content_writer.buffered(), .{
+        const auth_response = std.json.parseFromSliceLeaky(AuthResponse, scratch.allocator(), self.content_writer.buffered(), .{
             .ignore_unknown_fields = true,
         }) catch {
             std.debug.print("Unexpected auth: {s}\n", .{self.content_writer.buffered()});
             return;
         };
 
-        std.debug.print("Got auth response {any}\n", .{auth_response});
-        //try parent.event_sub_reg_state.setOauthKey(auth_response.access_token, auth_response.state);
+        // FIXME: Surely we should unit test this as it's somewhat security relevant
+        if (!std.mem.eql(u8, auth_response.state, &parent.oauth_state)) {
+            std.log.err("Got auth response with bad state \"{s}\" != \"{s}\"", .{ auth_response.state, parent.oauth_state });
+            // FIXME: Do we need to force close this connection on error
+            //
+            // FIXME: We should probably inform the client somehow? (maybe not, maybe showing in app UI is good enough)
+            return;
+        }
+
+        // FIXME: Do we need to force close this connection and on success
+        //
+        // FIXME: Thinka bout error types you ding dong
+        try parent.event_sub_reg_state.setAccessToken(scratch, auth_response.access_token);
     }
 
     const RelevantParams = struct {
@@ -244,7 +272,7 @@ const Connection = struct {
         };
 
         var code: []const u8 = "";
-        var state: []const u8  = "";
+        var state: []const u8 = "";
 
         while (it.next()) |kv| {
             const param_name = std.meta.stringToEnum(ParamName, kv.key) orelse continue;
@@ -279,3 +307,28 @@ const Connection = struct {
         }
     };
 };
+
+fn generateOauthState(rand: std.Random) OauthState {
+    var oauth_state: OauthState = undefined;
+    for (&oauth_state) |*c| {
+        // Technically (as per RFC 6749) we can use any characters in
+        // the range [0x20,0x7e], however we also send this in a URL.
+        // We could do something more clever, but this is the easiest
+        // thing for me to type in a single line :)
+        c.* = rand.intRangeAtMost(u8, 'a', 'z');
+    }
+
+    return oauth_state;
+}
+
+fn printAuthUrl(client_id: []const u8, oauth_state: *const OauthState) void {
+    const loc = "https://id.twitch.tv/oauth2/authorize" ++
+        "?response_type=token" ++
+        "&client_id={s}" ++
+        "&redirect_uri=http://localhost:3000" ++
+        "&scope=user%3Abot+user%3Aread%3Achat+user%3Awrite%3Achat" ++
+        "&state={s}";
+
+    std.debug.print("Go here if you aren't authenticated (not on stream) " ++ loc ++ "\n", .{client_id, oauth_state});
+
+}
