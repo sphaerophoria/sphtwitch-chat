@@ -12,17 +12,6 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe = b.addExecutable(.{
-        .name = "twitch_chat",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/twitch_chat.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    exe.root_module.addImport("sphws", sphws);
-    exe.root_module.addImport("sphtud", sphtud);
-
     const example = b.addExecutable(.{
         .name = "example",
         .root_module = b.createModule(.{
@@ -34,6 +23,5 @@ pub fn build(b: *std.Build) !void {
     example.root_module.addImport("sphws", sphws);
     example.root_module.addImport("sphtud", sphtud);
 
-    b.installArtifact(exe);
     b.installArtifact(example);
 }

@@ -8,111 +8,108 @@ const max_auth_connections = 100;
 
 const OauthState = [16]u8;
 
-pub fn AuthServer(comptime ids: EventIdList) type {
-    return struct {
-        serv: std.net.Server,
-        // FIXME: Basically no one will ever be here, one connection is good enough
-        connections: sphtud.util.ObjectPool(Connection, usize),
-        event_sub_reg_state: *event_sub.RegisterState,
+pub const AuthServer = struct {
+    serv: std.net.Server,
+    // FIXME: Basically no one will ever be here, one connection is good enough
+    connections: sphtud.util.ObjectPool(Connection, usize),
+    event_sub_reg_state: *event_sub.RegisterState,
 
-        oauth_state: OauthState,
+    oauth_state: OauthState,
 
-        loop: *sphtud.event.Loop2,
+    loop: *sphtud.event.Loop2,
 
-        const expansion_alloc = sphtud.util.ExpansionAlloc.invalid;
+    const expansion_alloc = sphtud.util.ExpansionAlloc.invalid;
 
-        const Self = @This();
+    const Self = @This();
 
-        pub fn init(loop: *sphtud.event.Loop2, alloc: std.mem.Allocator, event_sub_reg_state: *event_sub.RegisterState, rand: std.Random, client_id: []const u8) !Self {
+    pub fn init(loop: *sphtud.event.Loop2, alloc: std.mem.Allocator, event_sub_reg_state: *event_sub.RegisterState, rand: std.Random, client_id: []const u8, comptime id_list: EventIdList) !Self {
+        const oauth_state = generateOauthState(rand);
 
-            const oauth_state = generateOauthState(rand);
+        // FIXME: At some point this probably needs to re-attmept to auth
+        // if we lose auth or something, so this shoiuldn't live here. but
+        // for now it's ok probably maybe
+        printAuthUrl(client_id, &oauth_state);
 
-            // FIXME: At some point this probably needs to re-attmept to auth
-            // if we lose auth or something, so this shoiuldn't live here. but
-            // for now it's ok probably maybe
-            printAuthUrl(client_id, &oauth_state);
+        const address = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 3000);
+        const serv = try address.listen(.{
+            .reuse_address = true,
+        });
+        try sphtud.event.setNonblock(serv.stream.handle);
 
-            const address = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 3000);
-            const serv = try address.listen(.{
-                .reuse_address = true,
-            });
-            try sphtud.event.setNonblock(serv.stream.handle);
+        try loop.register(.{
+            .handle = serv.stream.handle,
+            .id = id_list.auth_accept,
+            .read = true,
+            .write = false,
+        });
 
-            try loop.register(.{
-                .handle = serv.stream.handle,
-                .id = ids.auth_accept,
+        return .{
+            .serv = serv,
+            .event_sub_reg_state = event_sub_reg_state,
+            .connections = try .init(
+                alloc,
+                expansion_alloc,
+                // The vast majority of the time no one will be here
+                8,
+                max_auth_connections,
+            ),
+            .oauth_state = oauth_state,
+            .loop = loop,
+        };
+    }
+
+    // FIXME: Error return type should be well defined here
+    pub fn poll(self: *Self, scratch: sphtud.alloc.LinearAllocator, in_event_id: usize, comptime id_list: EventIdList) !void {
+        switch (in_event_id) {
+            id_list.auth_accept => try self.pollAccept(scratch, id_list),
+            id_list.auth_connection.start...id_list.auth_connection.end => |event_id| {
+                try self.pollConnection(scratch, event_id - id_list.auth_connection.start);
+            },
+            else => unreachable,
+        }
+    }
+
+    fn pollAccept(self: *Self, scratch: sphtud.alloc.LinearAllocator, comptime id_list: EventIdList) !void {
+        while (true) {
+            const conn = self.serv.accept() catch |e| {
+                if (e == error.WouldBlock) break;
+                return e;
+            };
+
+            try sphtud.event.setNonblock(conn.stream.handle);
+
+            const stored = try self.connections.acquire(expansion_alloc);
+            stored.val.initPinned(conn.stream);
+
+            const event_id = id_list.auth_connection.start + stored.handle;
+
+            try self.loop.register(.{
+                .id = event_id,
+                .handle = conn.stream.handle,
                 .read = true,
                 .write = false,
             });
 
-            return .{
-                .serv = serv,
-                .event_sub_reg_state = event_sub_reg_state,
-                .connections = try .init(
-                    alloc,
-                    expansion_alloc,
-                    // The vast majority of the time no one will be here
-                    8,
-                    max_auth_connections,
-                ),
-                .oauth_state = oauth_state,
-                .loop = loop,
-            };
+            try self.pollConnection(scratch, stored.handle);
         }
+    }
 
-        // FIXME: Error return type should be well defined here
-        pub fn poll(self: *Self, scratch: sphtud.alloc.LinearAllocator, in_event_id: usize) !void {
-            switch (in_event_id) {
-                ids.auth_accept => try self.pollAccept(scratch),
-                ids.auth_connection.start...ids.auth_connection.end => |event_id| {
-                    try self.pollConnection(scratch, event_id - ids.auth_connection.start);
-                },
-                else => unreachable,
-            }
+    fn pollConnection(self: *Self, scratch: sphtud.alloc.LinearAllocator, conn_id: usize) !void {
+        const conn = self.connections.get(conn_id);
+
+        switch (conn.poll(scratch, self)) {
+            .wait => return,
+            .close => try self.releaseConnection(conn_id),
         }
+    }
 
-        fn pollAccept(self: *Self, scratch: sphtud.alloc.LinearAllocator) !void {
-            while (true) {
-                const conn = self.serv.accept() catch |e| {
-                    if (e == error.WouldBlock) break;
-                    return e;
-                };
-
-                try sphtud.event.setNonblock(conn.stream.handle);
-
-                const stored = try self.connections.acquire(expansion_alloc);
-                stored.val.initPinned(conn.stream);
-
-                const event_id = ids.auth_connection.start + stored.handle;
-
-                try self.loop.register(.{
-                    .id = event_id,
-                    .handle = conn.stream.handle,
-                    .read = true,
-                    .write = false,
-                });
-
-                try self.pollConnection(scratch, stored.handle);
-            }
-        }
-
-        fn pollConnection(self: *Self, scratch: sphtud.alloc.LinearAllocator, conn_id: usize) !void {
-            const conn = self.connections.get(conn_id);
-
-            switch (conn.poll(scratch, self)) {
-                .wait => return,
-                .close => try self.releaseConnection(conn_id),
-            }
-        }
-
-        fn releaseConnection(self: *Self, id: usize) !void {
-            const conn = self.connections.get(id);
-            try self.loop.unregister(conn.http.stream.stream.handle);
-            conn.http.deinit();
-            self.connections.release(expansion_alloc, id);
-        }
-    };
-}
+    fn releaseConnection(self: *Self, id: usize) !void {
+        const conn = self.connections.get(id);
+        try self.loop.unregister(conn.http.stream.stream.handle);
+        conn.http.deinit();
+        self.connections.release(expansion_alloc, id);
+    }
+};
 
 pub const EventIdList = struct {
     auth_accept: comptime_int,
@@ -160,7 +157,7 @@ const Connection = struct {
         close,
     };
 
-    fn poll(self: *Connection, scratch: sphtud.alloc.LinearAllocator, parent: anytype) PollResponse {
+    fn poll(self: *Connection, scratch: sphtud.alloc.LinearAllocator, parent: *AuthServer) PollResponse {
         const cp = scratch.checkpoint();
         while (true) {
             defer scratch.restore(cp);
@@ -181,7 +178,7 @@ const Connection = struct {
         }
     }
 
-    fn pollInner(self: *Connection, scratch: sphtud.alloc.LinearAllocator, parent: anytype) !void {
+    fn pollInner(self: *Connection, scratch: sphtud.alloc.LinearAllocator, parent: *AuthServer) !void {
         switch (self.state) {
             .default => try self.pollDefault(scratch.allocator()),
             .auth_body => |r| try self.pollAuthBody(scratch, r, parent),
@@ -225,27 +222,40 @@ const Connection = struct {
         }
     }
 
-    fn pollAuthBody(self: *Connection, scratch: sphtud.alloc.LinearAllocator, r: *std.Io.Reader, parent: anytype) !void {
+    fn pollAuthBody(self: *Connection, scratch: sphtud.alloc.LinearAllocator, r: *std.Io.Reader, parent: *AuthServer) !void {
         _ = try r.streamRemaining(&self.content_writer);
 
+        // If anything below fails, it fails, but we will be ready to read the
+        // next http header
         self.state = .default;
+
+        const cp = scratch.checkpoint();
+        defer scratch.restore(cp);
 
         const AuthResponse = struct {
             access_token: []const u8,
             state: []const u8,
         };
 
-        // FIXME: Will fall over if entire body buffer is not in req
-        const auth_response = std.json.parseFromSliceLeaky(AuthResponse, scratch.allocator(), self.content_writer.buffered(), .{
-            .ignore_unknown_fields = true,
-        }) catch {
-            std.debug.print("Unexpected auth: {s}\n", .{self.content_writer.buffered()});
+        const auth_response = std.json.parseFromSliceLeaky(
+            AuthResponse,
+            scratch.allocator(),
+            self.content_writer.buffered(),
+            .{
+                .ignore_unknown_fields = true,
+            },
+        ) catch {
+            std.log.err("Failed to parse auth response\n", .{});
             return;
         };
 
         // FIXME: Surely we should unit test this as it's somewhat security relevant
         if (!std.mem.eql(u8, auth_response.state, &parent.oauth_state)) {
-            std.log.err("Got auth response with bad state \"{s}\" != \"{s}\"", .{ auth_response.state, parent.oauth_state });
+            std.log.err(
+                "Got auth response with bad state \"{s}\" != \"{s}\"",
+                .{ auth_response.state, parent.oauth_state },
+            );
+
             // FIXME: Do we need to force close this connection on error
             //
             // FIXME: We should probably inform the client somehow? (maybe not, maybe showing in app UI is good enough)
@@ -256,40 +266,6 @@ const Connection = struct {
         //
         // FIXME: Thinka bout error types you ding dong
         try parent.event_sub_reg_state.setAccessToken(scratch, auth_response.access_token);
-    }
-
-    const RelevantParams = struct {
-        code: []const u8,
-        state: []const u8,
-    };
-
-    fn extractRelevantParams(target: []const u8) !RelevantParams {
-        var it = sphtud.http.url.QueryParamIter.init(target);
-
-        const ParamName = enum {
-            code,
-            state,
-        };
-
-        var code: []const u8 = "";
-        var state: []const u8 = "";
-
-        while (it.next()) |kv| {
-            const param_name = std.meta.stringToEnum(ParamName, kv.key) orelse continue;
-
-            switch (param_name) {
-                .code => code = kv.val,
-                .state => state = kv.val,
-            }
-        }
-
-        if (code.len == 0) return error.EmptyCode;
-        if (state.len == 0) return error.EmptyState;
-
-        return .{
-            .code = code,
-            .state = state,
-        };
     }
 
     const Target = enum {
@@ -329,6 +305,5 @@ fn printAuthUrl(client_id: []const u8, oauth_state: *const OauthState) void {
         "&scope=user%3Abot+user%3Aread%3Achat+user%3Awrite%3Achat" ++
         "&state={s}";
 
-    std.debug.print("Go here if you aren't authenticated (not on stream) " ++ loc ++ "\n", .{client_id, oauth_state});
-
+    std.debug.print("Go here if you aren't authenticated (not on stream) " ++ loc ++ "\n", .{ client_id, oauth_state });
 }

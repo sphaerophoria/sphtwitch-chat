@@ -70,12 +70,13 @@ pub fn main() !void {
         client_id,
     );
 
-    var auth_server = try as.AuthServer(id_list.auth).init(
+    var auth_server = try as.AuthServer.init(
         &loop,
         root_alloc.arena(),
         &register_state,
         rng.random(),
         client_id,
+        id_list.auth,
     );
 
     var event_sub_conn: event_sub.Connection = undefined;
@@ -94,7 +95,7 @@ pub fn main() !void {
         const event = try loop.poll();
         switch (event) {
             id_list.auth.start...id_list.auth.end => {
-                try auth_server.poll(scratch.linear(), event);
+                try auth_server.poll(scratch.linear(), event, id_list.auth);
             },
             id_list.websocket => {
                 try event_sub_conn.poll(scratch.linear());
