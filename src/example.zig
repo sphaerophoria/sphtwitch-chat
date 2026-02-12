@@ -59,23 +59,25 @@ pub fn main() !void {
 
     const xdg = try Xdg.init(root_alloc.arena());
 
-    var event_sub_conn: event_sub.Connection = undefined;
+    const event_sub_conn = try root_alloc.arena().create(event_sub.Connection);
     try event_sub_conn.initPinned(
         root_alloc.general(),
         scratch.linear(),
-        &http_client,
-        &xdg,
-        &ca_bundle,
-        rng.random(),
-        &loop,
-        client_id,
+        .{
+            .http_client = &http_client,
+            .xdg = &xdg,
+            .ca_bundle = &ca_bundle,
+            .random = rng.random(),
+            .loop = &loop,
+            .client_id = client_id,
+        },
         id_list.es,
     );
 
     var auth_server = try as.AuthServer.init(
         &loop,
         root_alloc.arena(),
-        &event_sub_conn,
+        event_sub_conn,
         rng.random(),
         client_id,
         id_list.auth,

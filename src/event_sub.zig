@@ -3,7 +3,6 @@
 // needs to be initialized when we have an oauth key ready to go
 //
 // * Probably the connection state machine should have a waiting_welcome and waiting_welcome_body_state
-// * RegisterState should probably not handle HTTP
 
 const std = @import("std");
 const sphtud = @import("sphtud");
@@ -29,168 +28,31 @@ pub const EventIdList = struct {
     }
 };
 
-pub const RegisterState = struct {
-    http_client: *http.Client,
+pub const ConnectionRefs = struct {
+    ca_bundle: *std.crypto.Certificate.Bundle,
+    random: std.Random,
+    loop: *sphtud.event.Loop2,
     xdg: *const Xdg,
-
-    // Needs to out-live state
+    http_client: *http.Client,
     client_id: []const u8,
-
-    // websocket_id/access_token have uncapped lengths, so we "have" to
-    // allocate them on the fly when we see them
-    managed: struct {
-        alloc: std.mem.Allocator,
-        websocket_id: []const u8 = "",
-        access_token: []const u8 = "",
-    },
-
-    // Register websocket http request if we are currently doing one
-    outstanding_req: ?http.Client.FetchHandle,
-
-    // Even those this is comptime known, feeding that comptime known data this
-    // deep down the call stack is annoying. Just stash it at runtime and
-    // reference
-    id_list: EventIdList,
-
-    const empty = "";
-
-
-    const Self = @This();
-
-    pub fn init(gpa: std.mem.Allocator, scratch: sphtud.alloc.LinearAllocator, http_client: *http.Client, id_list: EventIdList, xdg: *const Xdg, client_id: []const u8) !RegisterState {
-        const cp = scratch.checkpoint();
-        defer scratch.restore(cp);
-
-        const app_data_path = try getAccessTokenPath(scratch.allocator(), xdg.*);
-        const access_token = std.fs.cwd().readFileAlloc(gpa, app_data_path, std.math.maxInt(usize)) catch "";
-
-        return .{
-            .managed = .{
-                .alloc = gpa,
-                .access_token = access_token,
-            },
-            .xdg = xdg,
-            .http_client = http_client,
-            .id_list = id_list,
-            .outstanding_req = null,
-            .client_id = client_id,
-        };
-    }
-
-    pub fn setWsId(self: *Self, scratch: sphtud.alloc.LinearAllocator, id: []const u8) !void {
-        try replaceManaged(self.managed.alloc, &self.managed.websocket_id, id);
-        try self.maybeRegisterSocket(scratch);
-    }
-
-    pub fn setAccessToken(self: *Self, scratch: sphtud.alloc.LinearAllocator, token: []const u8) !void {
-        try replaceManaged(self.managed.alloc, &self.managed.access_token, token);
-
-        const app_data_path = try getAccessTokenPath(scratch.allocator(), self.xdg.*);
-
-        std.fs.cwd().writeFile(.{
-            .sub_path = app_data_path,
-            .data = token,
-        }) catch |e| {
-            std.log.err("Failed to save access token: {t}", .{e});
-        };
-
-        try self.maybeRegisterSocket(scratch);
-    }
-
-    fn getAccessTokenPath(alloc: std.mem.Allocator, xdg: Xdg) ![]const u8 {
-        return xdg.appdata(alloc, "auth_state.txt");
-    }
-
-    fn replaceManaged(alloc: std.mem.Allocator, stored: *[]const u8, data: []const u8) !void {
-        const new_stored = try alloc.dupe(u8, data);
-        alloc.free(stored.*);
-        stored.* = new_stored;
-    }
-
-    fn maybeRegisterSocket(self: *Self, scratch: sphtud.alloc.LinearAllocator) !void {
-        if (self.managed.websocket_id.len == 0) return;
-        if (self.managed.access_token.len == 0) return;
-
-        std.debug.print("Have WS ID and key\n", .{});
-
-        const cp = scratch.checkpoint();
-        defer scratch.restore(cp);
-
-        const conn = try self.http_client.fetch(
-            scratch.allocator(),
-            "api.twitch.tv",
-            443,
-            self.id_list.register_websocket,
-        );
-        self.outstanding_req = conn.handle;
-
-        // FIXME: Probably should be resolved in main() or something
-        const chat_id = "51219542";
-        const bot_id = "51219542";
-
-        const post_body = try std.json.Stringify.valueAlloc(
-            scratch.allocator(),
-            twitch_api.RegisterWebsocket{
-                .type = "channel.chat.message",
-                .version = "1",
-                .condition = .{
-                    .broadcaster_user_id = chat_id,
-                    .user_id = bot_id,
-                },
-                .transport = .{
-                    .method = "websocket",
-                    .session_id = self.managed.websocket_id,
-                },
-            },
-            .{ .whitespace = .indent_2 },
-        );
-
-        const bear_string = try std.fmt.allocPrint(scratch.allocator(), "Bearer {s}", .{self.managed.access_token});
-
-        const http_w = &conn.val.http_writer;
-        try http_w.startRequest(.{
-            .method = .POST,
-            .target = "/helix/eventsub/subscriptions",
-            .content_length = post_body.len,
-            .content_type = "application/json",
-        });
-        try http_w.appendHeader("Authorization", bear_string);
-        try http_w.appendHeader("Client-Id", self.client_id);
-        try http_w.appendHeader("Host", "api.twitch.tv");
-        try http_w.writeBody(post_body);
-
-        try conn.val.flush();
-    }
-
-    pub fn poll(self: *Self, scratch: sphtud.alloc.LinearAllocator) !void {
-        const outstanding_req = self.outstanding_req orelse return;
-        const conn = self.http_client.get(outstanding_req);
-
-        const res = conn.poll(scratch.allocator(), &.{}) catch |e| {
-            if (conn.isWouldBlock(e)) return;
-            return e;
-        };
-
-        // FIXME: Maybe we should close the app if it can't do anything?
-        std.debug.print("ws registration {t}\n", .{res.header.status});
-        self.http_client.release(outstanding_req);
-    }
 };
 
 pub const Connection = struct {
     tls: sphtud.net.TlsStream(4096, 4096),
     ws: sphws.Websocket,
 
-    ca_bundle: *std.crypto.Certificate.Bundle,
-    random: std.Random,
-    loop: *sphtud.event.Loop2,
+    refs: ConnectionRefs,
 
     // std.Io.Reader returned by websocket message notification uses this as
     // the backing buffer. We buffer the entire json message into here before
     // parsing
-    //
-    // When initializing we stash the oauth key in here
     ws_data_buf: [max_message_size]u8 = undefined,
+
+    managed: struct {
+        gpa: std.mem.Allocator,
+        // Access token has no defined length, so we "have" to allocate it
+        access_token: []const u8 = "",
+    },
 
     state: union(enum) {
         wait_access_token,
@@ -199,47 +61,58 @@ pub const Connection = struct {
         message: *std.Io.Reader,
     },
 
-    event_sub_reg_state: RegisterState,
+    // Register websocket http request if we are currently doing one
+    register_req: ?http.Client.FetchHandle,
+
     id_list: EventIdList,
 
     // We are expecting to have 1, mayyyybe 2 websockets for the whole app, so
-    // we can just shove our entire message content in here for now
+    // we can be fairly loose with this
     const max_message_size = 512 * 1024;
 
-    pub fn initPinned(self: *Connection, gpa: std.mem.Allocator, scratch: sphtud.alloc.LinearAllocator, http_client: *http.Client, xdg: *const Xdg, ca_bundle: *std.crypto.Certificate.Bundle, random: std.Random, loop: *sphtud.event.Loop2, client_id: []const u8, id_list: EventIdList) !void {
+    pub fn initPinned(self: *Connection, gpa: std.mem.Allocator, scratch: sphtud.alloc.LinearAllocator, refs: ConnectionRefs, id_list: EventIdList) !void {
+        const access_token = getStoredAccessToken(gpa, scratch.allocator(), refs.xdg) catch "";
+
         self.* = .{
             .tls = undefined,
             .ws = undefined,
-            .id_list = id_list,
-            .ca_bundle = ca_bundle,
-            .loop = loop,
+            .refs = refs,
             .state = .wait_access_token,
-            .random = random,
-            .event_sub_reg_state = try RegisterState.init(
-                gpa,
-                scratch,
-                http_client,
-                id_list,
-                xdg,
-                client_id,
-            ),
+            .register_req = null,
+            .managed = .{
+                .gpa = gpa,
+                .access_token = access_token,
+            },
+            .id_list = id_list,
         };
 
-        if (self.event_sub_reg_state.managed.access_token.len > 0) {
+        if (self.managed.access_token.len > 0) {
             try self.connectWebsocket(scratch);
         }
     }
 
 
     pub fn setAccessToken(self: *Connection, scratch: sphtud.alloc.LinearAllocator, token: []const u8) !void {
-        try self.event_sub_reg_state.setAccessToken(scratch, token);
+        try replaceManaged(self.managed.gpa, &self.managed.access_token, token);
+
+        const app_data_path = try getAccessTokenPath(scratch.allocator(), self.refs.xdg.*);
+
+        std.fs.cwd().writeFile(.{
+            .sub_path = app_data_path,
+            .data = token,
+        }) catch |e| {
+            std.log.err("Failed to save access token: {t}", .{e});
+        };
+
         try self.connectWebsocket(scratch);
     }
 
     fn connectWebsocket(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
         if (self.connectionValid()) {
-            try self.loop.unregister(self.tls.handle());
+            try self.refs.loop.unregister(self.tls.handle());
             self.tls.close();
+            self.tls = undefined;
+            self.ws = undefined;
         }
 
         self.state = .init_tls;
@@ -247,15 +120,15 @@ pub const Connection = struct {
         const uri_meta = try sphws.UriMetadata.fromString(scratch.allocator(), "wss://eventsub.wss.twitch.tv/ws");
 
         const std_stream = try std.net.tcpConnectToHost(scratch.allocator(), uri_meta.host, uri_meta.port);
-        try self.tls.initPinned(std_stream, uri_meta.host, self.ca_bundle.*);
+        try self.tls.initPinned(std_stream, uri_meta.host, self.refs.ca_bundle.*);
         errdefer self.tls.close();
 
-        self.ws = try sphws.Websocket.init(self.tls.reader(), self.tls.writer(), uri_meta.host, uri_meta.path, self.random);
+        self.ws = try sphws.Websocket.init(self.tls.reader(), self.tls.writer(), uri_meta.host, uri_meta.path, self.refs.random);
         try self.tls.flush();
 
         try sphtud.event.setNonblock(self.tls.handle());
 
-        try self.loop.register(.{
+        try self.refs.loop.register(.{
             .handle = self.tls.handle(),
             .id = self.id_list.websocket_message,
             .read = true,
@@ -270,33 +143,46 @@ pub const Connection = struct {
             .wait_access_token, .init_tls => false,
             .default, .message => true,
         };
-
     }
+
     // FIXME: Evaluate and limit errors
     //
     // FIXME: On EndOfStream re-init the connection? Maybe on a timer
     pub fn poll(self: *Connection, scratch: sphtud.alloc.LinearAllocator, event: usize, comptime id_list: EventIdList) !void {
         switch (event) {
             id_list.websocket_message => try self.pollWs(scratch),
-            id_list.register_websocket => try self.event_sub_reg_state.poll(scratch),
+            id_list.register_websocket => try self.pollRegister(scratch),
             else => unreachable,
         }
     }
 
-    pub fn pollWs(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
+    pub fn pollRegister(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
+        const register_req = self.register_req orelse return;
+        const conn = self.refs.http_client.get(register_req);
 
+        const res = conn.poll(scratch.allocator(), &.{}) catch |e| {
+            if (conn.isWouldBlock(e)) return;
+            return e;
+        };
+
+        // FIXME: Maybe we should close the app if it can't do anything?
+        std.debug.print("ws registration {t}\n", .{res.header.status});
+        self.refs.http_client.release(register_req);
+    }
+
+    pub fn pollWs(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
         const cp = scratch.checkpoint();
         while (true) {
             defer scratch.restore(cp);
 
-            self.pollInner(scratch) catch |e| {
+            self.pollWsInner(scratch) catch |e| {
                 if (self.tls.isWouldBlock(e)) return;
                 return e;
             };
         }
     }
 
-    pub fn pollInner(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
+    pub fn pollWsInner(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
         switch (self.state) {
             .wait_access_token, .init_tls => unreachable,
             .default => try self.pollDefault(),
@@ -350,7 +236,9 @@ pub const Connection = struct {
                 };
 
                 std.debug.print("Setting websocket id: {s}\n", .{welcome.payload.session.id});
-                try self.event_sub_reg_state.setWsId(scratch, welcome.payload.session.id);
+
+                if (self.managed.access_token.len == 0) return error.NoAccessToken;
+                self.register_req = try registerSocket(scratch.allocator(), self.refs.http_client, self.managed.access_token, self.refs.client_id, welcome.payload.session.id, self.id_list.register_websocket,);
             },
             .notification => {},
         }
@@ -370,3 +258,66 @@ pub const Connection = struct {
         }
     }
 };
+
+fn registerSocket(scratch: std.mem.Allocator, http_client: *http.Client, access_token: []const u8, client_id: []const u8, websocket_id: []const u8, event_id: usize,) !http.Client.FetchHandle {
+        const conn = try http_client.fetch(
+            scratch,
+            "api.twitch.tv",
+            443,
+            event_id,
+        );
+
+        // FIXME: Probably should be resolved in main() or something
+        const chat_id = "51219542";
+        const bot_id = "51219542";
+
+        const post_body = try std.json.Stringify.valueAlloc(
+            scratch,
+            twitch_api.RegisterWebsocket{
+                .type = "channel.chat.message",
+                .version = "1",
+                .condition = .{
+                    .broadcaster_user_id = chat_id,
+                    .user_id = bot_id,
+                },
+                .transport = .{
+                    .method = "websocket",
+                    .session_id = websocket_id,
+                },
+            },
+            .{ .whitespace = .indent_2 },
+        );
+
+        const bear_string = try std.fmt.allocPrint(scratch, "Bearer {s}", .{access_token});
+
+        const http_w = &conn.val.http_writer;
+        try http_w.startRequest(.{
+            .method = .POST,
+            .target = "/helix/eventsub/subscriptions",
+            .content_length = post_body.len,
+            .content_type = "application/json",
+        });
+        try http_w.appendHeader("Authorization", bear_string);
+        try http_w.appendHeader("Client-Id", client_id);
+        try http_w.appendHeader("Host", "api.twitch.tv");
+        try http_w.writeBody(post_body);
+
+        try conn.val.flush();
+        return conn.handle;
+
+}
+
+fn getAccessTokenPath(alloc: std.mem.Allocator, xdg: Xdg) ![]const u8 {
+    return xdg.appdata(alloc, "auth_state.txt");
+}
+
+fn replaceManaged(alloc: std.mem.Allocator, stored: *[]const u8, data: []const u8) !void {
+    const new_stored = try alloc.dupe(u8, data);
+    alloc.free(stored.*);
+    stored.* = new_stored;
+}
+
+fn getStoredAccessToken(alloc: std.mem.Allocator, scratch: std.mem.Allocator, xdg: *const Xdg) ![]const u8 {
+    const app_data_path = try getAccessTokenPath(scratch, xdg.*);
+    return std.fs.cwd().readFileAlloc(alloc, app_data_path, std.math.maxInt(usize));
+}
