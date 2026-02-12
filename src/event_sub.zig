@@ -1,3 +1,10 @@
+// FIXME: Generally this file is structured pretty poorly. Evolved from
+// RegisterState and Connection being split, but realized that the websocket
+// needs to be initialized when we have an oauth key ready to go
+//
+// * Probably the connection state machine should have a waiting_welcome and waiting_welcome_body_state
+// * RegisterState should probably not handle HTTP
+
 const std = @import("std");
 const sphtud = @import("sphtud");
 const sphws = @import("sphws");
@@ -5,6 +12,22 @@ const EventIdIter = @import("EventIdIter.zig");
 const http = @import("http.zig");
 const Xdg = @import("Xdg.zig");
 const twitch_api = @import("twitch_api.zig");
+
+pub const EventIdList = struct {
+    start: usize,
+    register_websocket: usize,
+    websocket_message: usize,
+    end: usize,
+
+    pub fn generate(id_iter: *EventIdIter) EventIdList {
+        return .{
+            .start = id_iter.markStart(),
+            .register_websocket = id_iter.one(),
+            .websocket_message = id_iter.one(),
+            .end = id_iter.markEnd(),
+        };
+    }
+};
 
 pub const RegisterState = struct {
     http_client: *http.Client,
@@ -31,19 +54,6 @@ pub const RegisterState = struct {
 
     const empty = "";
 
-    pub const EventIdList = struct {
-        register_websocket: usize,
-        start: usize,
-        end: usize,
-
-        pub fn generate(id_iter: *EventIdIter) EventIdList {
-            return .{
-                .start = id_iter.markStart(),
-                .register_websocket = id_iter.one(),
-                .end = id_iter.markEnd(),
-            };
-        }
-    };
 
     const Self = @This();
 
@@ -171,48 +181,110 @@ pub const Connection = struct {
     tls: sphtud.net.TlsStream(4096, 4096),
     ws: sphws.Websocket,
 
+    ca_bundle: *std.crypto.Certificate.Bundle,
+    random: std.Random,
+    loop: *sphtud.event.Loop2,
+
     // std.Io.Reader returned by websocket message notification uses this as
     // the backing buffer. We buffer the entire json message into here before
     // parsing
+    //
+    // When initializing we stash the oauth key in here
     ws_data_buf: [max_message_size]u8 = undefined,
 
     state: union(enum) {
+        wait_access_token,
+        init_tls,
         default,
         message: *std.Io.Reader,
     },
 
-    event_sub_reg_state: *RegisterState,
+    event_sub_reg_state: RegisterState,
+    id_list: EventIdList,
 
     // We are expecting to have 1, mayyyybe 2 websockets for the whole app, so
     // we can just shove our entire message content in here for now
     const max_message_size = 512 * 1024;
 
-    pub fn initPinned(self: *Connection, scratch: std.mem.Allocator, ca_bundle: std.crypto.Certificate.Bundle, random: std.Random, event_sub_reg_state: *RegisterState, loop: *sphtud.event.Loop2, comptime ws_id: usize) !void {
-        const uri_meta = try sphws.UriMetadata.fromString(scratch, "wss://eventsub.wss.twitch.tv/ws");
+    pub fn initPinned(self: *Connection, gpa: std.mem.Allocator, scratch: sphtud.alloc.LinearAllocator, http_client: *http.Client, xdg: *const Xdg, ca_bundle: *std.crypto.Certificate.Bundle, random: std.Random, loop: *sphtud.event.Loop2, client_id: []const u8, id_list: EventIdList) !void {
+        self.* = .{
+            .tls = undefined,
+            .ws = undefined,
+            .id_list = id_list,
+            .ca_bundle = ca_bundle,
+            .loop = loop,
+            .state = .wait_access_token,
+            .random = random,
+            .event_sub_reg_state = try RegisterState.init(
+                gpa,
+                scratch,
+                http_client,
+                id_list,
+                xdg,
+                client_id,
+            ),
+        };
 
-        const std_stream = try std.net.tcpConnectToHost(scratch, uri_meta.host, uri_meta.port);
-        try self.tls.initPinned(std_stream, uri_meta.host, ca_bundle);
+        if (self.event_sub_reg_state.managed.access_token.len > 0) {
+            try self.connectWebsocket(scratch);
+        }
+    }
 
-        self.ws = try sphws.Websocket.init(self.tls.reader(), self.tls.writer(), uri_meta.host, uri_meta.path, random);
+
+    pub fn setAccessToken(self: *Connection, scratch: sphtud.alloc.LinearAllocator, token: []const u8) !void {
+        try self.event_sub_reg_state.setAccessToken(scratch, token);
+        try self.connectWebsocket(scratch);
+    }
+
+    fn connectWebsocket(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
+        if (self.connectionValid()) {
+            try self.loop.unregister(self.tls.handle());
+            self.tls.close();
+        }
+
+        self.state = .init_tls;
+
+        const uri_meta = try sphws.UriMetadata.fromString(scratch.allocator(), "wss://eventsub.wss.twitch.tv/ws");
+
+        const std_stream = try std.net.tcpConnectToHost(scratch.allocator(), uri_meta.host, uri_meta.port);
+        try self.tls.initPinned(std_stream, uri_meta.host, self.ca_bundle.*);
+        errdefer self.tls.close();
+
+        self.ws = try sphws.Websocket.init(self.tls.reader(), self.tls.writer(), uri_meta.host, uri_meta.path, self.random);
         try self.tls.flush();
 
         try sphtud.event.setNonblock(self.tls.handle());
 
-        self.state = .default;
-        self.event_sub_reg_state = event_sub_reg_state;
-
-        try loop.register(.{
+        try self.loop.register(.{
             .handle = self.tls.handle(),
-            .id = ws_id,
+            .id = self.id_list.websocket_message,
             .read = true,
             .write = false,
         });
+
+        self.state = .default;
     }
 
+    fn connectionValid(self: *Connection) bool {
+        return switch (self.state) {
+            .wait_access_token, .init_tls => false,
+            .default, .message => true,
+        };
+
+    }
     // FIXME: Evaluate and limit errors
     //
     // FIXME: On EndOfStream re-init the connection? Maybe on a timer
-    pub fn poll(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
+    pub fn poll(self: *Connection, scratch: sphtud.alloc.LinearAllocator, event: usize, comptime id_list: EventIdList) !void {
+        switch (event) {
+            id_list.websocket_message => try self.pollWs(scratch),
+            id_list.register_websocket => try self.event_sub_reg_state.poll(scratch),
+            else => unreachable,
+        }
+    }
+
+    pub fn pollWs(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
+
         const cp = scratch.checkpoint();
         while (true) {
             defer scratch.restore(cp);
@@ -226,6 +298,7 @@ pub const Connection = struct {
 
     pub fn pollInner(self: *Connection, scratch: sphtud.alloc.LinearAllocator) !void {
         switch (self.state) {
+            .wait_access_token, .init_tls => unreachable,
             .default => try self.pollDefault(),
             .message => |data| try self.pollMessageData(scratch, data),
         }

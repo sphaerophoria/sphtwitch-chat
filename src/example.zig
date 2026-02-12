@@ -9,17 +9,15 @@ const Xdg = @import("Xdg.zig");
 
 const EventIdList = struct {
     auth: as.EventIdList,
-    websocket: comptime_int,
     fetch: http.Client.EventIdList,
-    event_sub_reg: event_sub.RegisterState.EventIdList,
+    es: event_sub.EventIdList,
 
     pub fn generate() EventIdList {
         var id_iter = EventIdIter{};
         return .{
             .auth = as.EventIdList.generate(&id_iter),
-            .websocket = id_iter.one(),
             .fetch = .generate(&id_iter),
-            .event_sub_reg = .generate(&id_iter),
+            .es = .generate(&id_iter),
         };
     }
 };
@@ -61,32 +59,26 @@ pub fn main() !void {
 
     const xdg = try Xdg.init(root_alloc.arena());
 
-    var register_state = try event_sub.RegisterState.init(
+    var event_sub_conn: event_sub.Connection = undefined;
+    try event_sub_conn.initPinned(
         root_alloc.general(),
         scratch.linear(),
         &http_client,
-        id_list.event_sub_reg,
         &xdg,
+        &ca_bundle,
+        rng.random(),
+        &loop,
         client_id,
+        id_list.es,
     );
 
     var auth_server = try as.AuthServer.init(
         &loop,
         root_alloc.arena(),
-        &register_state,
+        &event_sub_conn,
         rng.random(),
         client_id,
         id_list.auth,
-    );
-
-    var event_sub_conn: event_sub.Connection = undefined;
-    try event_sub_conn.initPinned(
-        scratch.allocator(),
-        ca_bundle,
-        rng.random(),
-        &register_state,
-        &loop,
-        id_list.websocket,
     );
 
     while (true) {
@@ -97,11 +89,8 @@ pub fn main() !void {
             id_list.auth.start...id_list.auth.end => {
                 try auth_server.poll(scratch.linear(), event, id_list.auth);
             },
-            id_list.websocket => {
-                try event_sub_conn.poll(scratch.linear());
-            },
-            id_list.event_sub_reg.start...id_list.event_sub_reg.end => {
-                try register_state.poll(scratch.linear());
+            id_list.es.start...id_list.es.end => {
+                try event_sub_conn.poll(scratch.linear(), event, id_list.es);
             },
             else => unreachable,
         }

@@ -12,7 +12,7 @@ pub const AuthServer = struct {
     serv: std.net.Server,
     // FIXME: Basically no one will ever be here, one connection is good enough
     connections: sphtud.util.ObjectPool(Connection, usize),
-    event_sub_reg_state: *event_sub.RegisterState,
+    websocket: *event_sub.Connection,
 
     oauth_state: OauthState,
 
@@ -22,12 +22,16 @@ pub const AuthServer = struct {
 
     const Self = @This();
 
-    pub fn init(loop: *sphtud.event.Loop2, alloc: std.mem.Allocator, event_sub_reg_state: *event_sub.RegisterState, rand: std.Random, client_id: []const u8, comptime id_list: EventIdList) !Self {
+    pub fn init(loop: *sphtud.event.Loop2, alloc: std.mem.Allocator, websocket: *event_sub.Connection, rand: std.Random, client_id: []const u8, comptime id_list: EventIdList) !Self {
+        // FIXME: Do we need to re-gen oauth state after accepting?
         const oauth_state = generateOauthState(rand);
 
         // FIXME: At some point this probably needs to re-attmept to auth
         // if we lose auth or something, so this shoiuldn't live here. but
         // for now it's ok probably maybe
+        //
+        // FIXME: On init we likely already have a key, so like, why are we
+        // printing this here?
         printAuthUrl(client_id, &oauth_state);
 
         const address = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 3000);
@@ -45,7 +49,7 @@ pub const AuthServer = struct {
 
         return .{
             .serv = serv,
-            .event_sub_reg_state = event_sub_reg_state,
+            .websocket = websocket,
             .connections = try .init(
                 alloc,
                 expansion_alloc,
@@ -265,7 +269,7 @@ const Connection = struct {
         // FIXME: Do we need to force close this connection and on success
         //
         // FIXME: Thinka bout error types you ding dong
-        try parent.event_sub_reg_state.setAccessToken(scratch, auth_response.access_token);
+        try parent.websocket.setAccessToken(scratch, auth_response.access_token);
     }
 
     const Target = enum {
