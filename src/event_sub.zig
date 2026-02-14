@@ -1,9 +1,3 @@
-// FIXME: Generally this file is structured pretty poorly. Evolved from
-// RegisterState and Connection being split, but realized that the websocket
-// needs to be initialized when we have an oauth key ready to go
-//
-// * Probably the connection state machine should have a waiting_welcome and waiting_welcome_body_state
-
 const std = @import("std");
 const sphtud = @import("sphtud");
 const sphws = @import("sphws");
@@ -11,6 +5,7 @@ const EventIdIter = @import("EventIdIter.zig");
 const http = @import("http.zig");
 const Xdg = @import("Xdg.zig");
 const twitch_api = @import("twitch_api.zig");
+const MessageDb = @import("MessageDb.zig");
 
 pub const EventIdList = struct {
     start: usize,
@@ -35,6 +30,7 @@ pub const ConnectionRefs = struct {
     xdg: *const Xdg,
     http_client: *http.Client,
     client_id: []const u8,
+    message_db: *MessageDb,
 };
 
 pub const Connection = struct {
@@ -66,12 +62,22 @@ pub const Connection = struct {
 
     id_list: EventIdList,
 
+    record_file: std.fs.File,
+    record_writer_buf: [4096]u8 = undefined,
+    record_writer: std.fs.File.Writer,
+
     // We are expecting to have 1, mayyyybe 2 websockets for the whole app, so
     // we can be fairly loose with this
     const max_message_size = 512 * 1024;
 
     pub fn initPinned(self: *Connection, gpa: std.mem.Allocator, scratch: sphtud.alloc.LinearAllocator, refs: ConnectionRefs, id_list: EventIdList) !void {
         const access_token = getStoredAccessToken(gpa, scratch.allocator(), refs.xdg) catch "";
+
+        const record_path = try refs.xdg.appdata(scratch.allocator(), "ws_record.txt");
+        const record_file = try std.fs.cwd().createFile(record_path, .{
+            .read = true,
+            .truncate = false,
+        });
 
         self.* = .{
             .tls = undefined,
@@ -84,13 +90,28 @@ pub const Connection = struct {
                 .access_token = access_token,
             },
             .id_list = id_list,
+            .record_file = record_file,
+            .record_writer = record_file.writer(&self.record_writer_buf),
         };
+
+        var reader_buf: [4096]u8 = undefined;
+        var record_reader = record_file.reader(&reader_buf);
+
+        try self.loadFromHistory(scratch, &record_reader.interface);
+        try self.record_writer.seekTo(try record_file.getEndPos());
 
         if (self.managed.access_token.len > 0) {
             try self.connectWebsocket(scratch);
         }
     }
 
+    pub fn deinit(self: *Connection) void {
+        if (self.connectionValid()) {
+            self.tls.close();
+        }
+
+        self.record_file.close();
+    }
 
     pub fn setAccessToken(self: *Connection, scratch: sphtud.alloc.LinearAllocator, token: []const u8) !void {
         try replaceManaged(self.managed.gpa, &self.managed.access_token, token);
@@ -165,6 +186,8 @@ pub const Connection = struct {
             return e;
         };
 
+        self.register_req = null;
+
         // FIXME: Maybe we should close the app if it can't do anything?
         std.debug.print("ws registration {t}\n", .{res.header.status});
         self.refs.http_client.release(register_req);
@@ -186,38 +209,37 @@ pub const Connection = struct {
         switch (self.state) {
             .wait_access_token, .init_tls => unreachable,
             .default => try self.pollDefault(),
-            .message => |data| try self.pollMessageData(scratch, data),
+            .message => |data| self.pollMessageData(scratch, data) catch |e| {
+                if (self.tls.isWouldBlock(e)) return;
+
+                self.state = .default;
+                std.log.err("Dropped message: {t}\n", .{e});
+            },
         }
 
         try self.tls.flush();
     }
 
-    fn pollMessageData(self: *Connection, scratch: sphtud.alloc.LinearAllocator, data: *std.Io.Reader) !void {
-        // Fill data's buffer until literally end of stream
+    fn pollMessageData(self: *Connection, scratch: sphtud.alloc.LinearAllocator, data_reader: *std.Io.Reader) !void {
+        const message = try entireStreamBuffered(data_reader);
+
+        recordMessage(message, &self.record_writer.interface) catch |e| {
+            std.log.err("Droppping record {t}\n", .{e});
+        };
 
         // FIXME: Read segment probably wants it's own fn
-        if (data.end == data.buffer.len) {
-            return error.MessageTooLarge;
-        }
-
-        while (true) {
-            _ = data.fillMore() catch |e| {
-                if (e == error.EndOfStream) break;
-                return e;
-            };
-        }
-
         self.state = .default;
 
         const common = std.json.parseFromSliceLeaky(
             twitch_api.websocket.CommonMessage,
             scratch.allocator(),
-            data.buffered(),
+            message,
             .{ .ignore_unknown_fields = true },
         ) catch {
-            std.log.err("Invalid json message: {s}\n", .{data.buffered()});
+            std.log.err("Invalid json message: {s}\n", .{message});
             return;
         };
+
 
         std.debug.print("Received message: {any}\n", .{common});
 
@@ -228,19 +250,27 @@ pub const Connection = struct {
                 const welcome = std.json.parseFromSliceLeaky(
                     twitch_api.websocket.SessionWelcome,
                     scratch.allocator(),
-                    data.buffered(),
+                    message,
                     .{ .ignore_unknown_fields = true },
                 ) catch {
-                    std.log.err("Invalid welcome message: {s}\n", .{data.buffered()});
+                    std.log.err("Invalid welcome message: {s}\n", .{message});
                     return;
                 };
 
                 std.debug.print("Setting websocket id: {s}\n", .{welcome.payload.session.id});
 
                 if (self.managed.access_token.len == 0) return error.NoAccessToken;
-                self.register_req = try registerSocket(scratch.allocator(), self.refs.http_client, self.managed.access_token, self.refs.client_id, welcome.payload.session.id, self.id_list.register_websocket,);
+
+                self.register_req = try registerSocket(
+                    scratch.allocator(),
+                    self.refs.http_client,
+                    self.managed.access_token,
+                    self.refs.client_id,
+                    welcome.payload.session.id,
+                    self.id_list.register_websocket,
+                );
             },
-            .notification => {},
+            .notification => try self.handleNotification(scratch,message),
         }
     }
 
@@ -257,54 +287,128 @@ pub const Connection = struct {
             .none => {},
         }
     }
+
+    fn handleNotification(self: *Connection, scratch: sphtud.alloc.LinearAllocator, message: []const u8) !void {
+        // FIXME: Insert into message db
+        const notification = try std.json.parseFromSliceLeaky(
+            twitch_api.websocket.Notification,
+            scratch.allocator(),
+            message,
+            .{ .ignore_unknown_fields = true },
+        );
+
+        if (!std.mem.eql(u8, "channel.chat.message", notification.payload.subscription.type)) return;
+
+        const chat_message = try std.json.parseFromValueLeaky(
+            twitch_api.websocket.ChatMessageEvent,
+            scratch.allocator(),
+            notification.payload.event,
+            .{ .ignore_unknown_fields = true },
+        );
+
+        try self.refs.message_db.push( chat_message.chatter_user_name, chat_message.message.text );
+    }
+
+
+    fn recordMessage(message: []const u8, writer: *std.Io.Writer) !void {
+        try writer.writeAll(message);
+        try writer.writeByte(0);
+        try writer.writeByte('\n');
+        try writer.flush();
+    }
+
+    fn loadFromHistory(self: *Connection, scratch: sphtud.alloc.LinearAllocator, reader: *std.Io.Reader) !void {
+
+        const cp = scratch.checkpoint();
+        // Advance cursor until we see '\0\n'
+        while (true) {
+            defer scratch.restore(cp);
+
+            const buffer = reader.buffered();
+            std.debug.print("Buffered data: {s}\n", .{buffer});
+            const message_len = std.mem.indexOf(u8, buffer, &.{0, '\n'}) orelse {
+                reader.fillMore() catch |e| switch (e) {
+                    error.EndOfStream => break,
+                    else => return e,
+                };
+                continue;
+            };
+
+            reader.toss(message_len + 2);
+            const message = buffer[0..message_len];
+            std.debug.print("message_len: {d}, message data: {s}\n", .{message_len, message});
+
+            const common = std.json.parseFromSliceLeaky(
+                twitch_api.websocket.CommonMessage,
+                scratch.allocator(),
+                message,
+                .{ .ignore_unknown_fields = true },
+            ) catch {
+                std.log.err("Invalid json message: {s}\n", .{message});
+                return;
+            };
+
+            const message_type = common.messageType() orelse continue;
+            switch (message_type) {
+                .session_welcome => {},
+                .notification => try self.handleNotification(scratch,message),
+            }
+        }
+    }
 };
 
-fn registerSocket(scratch: std.mem.Allocator, http_client: *http.Client, access_token: []const u8, client_id: []const u8, websocket_id: []const u8, event_id: usize,) !http.Client.FetchHandle {
-        const conn = try http_client.fetch(
-            scratch,
-            "api.twitch.tv",
-            443,
-            event_id,
-        );
+fn registerSocket(
+    scratch: std.mem.Allocator,
+    http_client: *http.Client,
+    access_token: []const u8,
+    client_id: []const u8,
+    websocket_id: []const u8,
+    event_id: usize,
+) !http.Client.FetchHandle {
+    const conn = try http_client.fetch(
+        scratch,
+        "api.twitch.tv",
+        443,
+        event_id,
+    );
 
-        // FIXME: Probably should be resolved in main() or something
-        const chat_id = "51219542";
-        const bot_id = "51219542";
+    // FIXME: Probably should be resolved in main() or something
+    const chat_id = "51219542";
+    const bot_id = "51219542";
 
-        const post_body = try std.json.Stringify.valueAlloc(
-            scratch,
-            twitch_api.RegisterWebsocket{
-                .type = "channel.chat.message",
-                .version = "1",
-                .condition = .{
-                    .broadcaster_user_id = chat_id,
-                    .user_id = bot_id,
-                },
-                .transport = .{
-                    .method = "websocket",
-                    .session_id = websocket_id,
-                },
+    const post_body = try std.json.Stringify.valueAlloc(
+        scratch,
+        twitch_api.RegisterWebsocket{
+            .type = "channel.chat.message",
+            .version = "1",
+            .condition = .{
+                .broadcaster_user_id = chat_id,
+                .user_id = bot_id,
             },
-            .{ .whitespace = .indent_2 },
-        );
+            .transport = .{
+                .method = "websocket",
+                .session_id = websocket_id,
+            },
+        },
+        .{ .whitespace = .indent_2 },
+    );
 
-        const bear_string = try std.fmt.allocPrint(scratch, "Bearer {s}", .{access_token});
+    const bear_string = try std.fmt.allocPrint(scratch, "Bearer {s}", .{access_token});
 
-        const http_w = &conn.val.http_writer;
-        try http_w.startRequest(.{
-            .method = .POST,
-            .target = "/helix/eventsub/subscriptions",
-            .content_length = post_body.len,
-            .content_type = "application/json",
-        });
-        try http_w.appendHeader("Authorization", bear_string);
-        try http_w.appendHeader("Client-Id", client_id);
-        try http_w.appendHeader("Host", "api.twitch.tv");
-        try http_w.writeBody(post_body);
+    const http_w = &conn.val.http_writer;
+    try http_w.startRequest(.{
+        .method = .POST,
+        .target = "/helix/eventsub/subscriptions",
+        .content_length = post_body.len,
+        .content_type = "application/json",
+    });
+    try http_w.appendHeader("Authorization", bear_string);
+    try http_w.appendHeader("Client-Id", client_id);
+    try http_w.appendHeader("Host", "api.twitch.tv");
+    try http_w.writeBody(post_body);
 
-        try conn.val.flush();
-        return conn.handle;
-
+    try conn.val.flush();
+    return conn.handle;
 }
 
 fn getAccessTokenPath(alloc: std.mem.Allocator, xdg: Xdg) ![]const u8 {
@@ -320,4 +424,15 @@ fn replaceManaged(alloc: std.mem.Allocator, stored: *[]const u8, data: []const u
 fn getStoredAccessToken(alloc: std.mem.Allocator, scratch: std.mem.Allocator, xdg: *const Xdg) ![]const u8 {
     const app_data_path = try getAccessTokenPath(scratch, xdg.*);
     return std.fs.cwd().readFileAlloc(alloc, app_data_path, std.math.maxInt(usize));
+}
+
+fn entireStreamBuffered(data: *std.Io.Reader) ![]const u8 {
+    while (data.end < data.buffer.len) {
+        _ = data.fillMore() catch |e| {
+            if (e == error.EndOfStream) return data.buffered();
+            return e;
+        };
+    }
+
+    return error.MessageTooLarge;
 }

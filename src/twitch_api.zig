@@ -31,4 +31,21 @@ pub const websocket = struct {
             },
         },
     };
+
+    pub const ChatMessageEvent = struct {
+        chatter_user_name: []const u8,
+        message: struct {
+            text: []const u8,
+            // FIXME: Parse fragments and render emotes, @s, etc.
+        },
+    };
+
+    pub const Notification = struct {
+        payload: struct {
+            subscription: struct {
+                type: []const u8,
+            },
+            event: std.json.Value,
+        },
+    };
 };

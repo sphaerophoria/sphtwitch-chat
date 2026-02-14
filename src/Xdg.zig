@@ -19,8 +19,8 @@ pub fn init(alloc: std.mem.Allocator) !Xdg {
     };
 }
 
-pub fn appdata(self: Xdg, alloc: std.mem.Allocator, sub_path: []const u8) ![]const u8 {
-    return std.fs.path.join(alloc, &.{ self.data_root, sub_path });
+pub fn appdata(self: Xdg, alloc: std.mem.Allocator, sub_path: []const u8) ![:0]const u8 {
+    return std.fs.path.joinZ(alloc, &.{ self.data_root, sub_path });
 }
 
 fn resolveDataRoot(buf: []u8) ![]const u8 {

@@ -6,7 +6,10 @@ pub fn build(b: *std.Build) !void {
     const sphws_dep = b.dependency("sphws", .{});
     const sphws = sphws_dep.module("sphws");
 
-    const sphtud_dep = b.dependency("sphtud", .{});
+    const sphtud_dep = b.dependency("sphtud", .{
+        .with_gl = true,
+        .with_glfw = true,
+    });
     const sphtud = sphtud_dep.module("sphtud");
 
     const target = b.standardTargetOptions(.{});
