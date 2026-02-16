@@ -134,7 +134,7 @@ pub fn main() !void {
                 std.debug.print("code len: {d}\n", .{lzw_min_code_size});
                 var lzwd = try LzwDecompressor.init(alloc.allocator(), lzw_min_code_size, &sdr.interface);
                 var written_bytes: usize = 0;
-                while (try lzwd.step(scratch.allocator())) |seq| {
+                while (try lzwd.step()) |seq| {
                     scratch.end_index = 0;
                     written_bytes += seq.len;
                     std.debug.print("seq: {any}\n", .{seq});
@@ -233,6 +233,7 @@ const LzwDecompressor = struct {
     const Code = u12;
     const Sequence = []u12;
 
+
     pub fn init(alloc: std.mem.Allocator, initial_code_len: u8, r: *std.Io.Reader) !LzwDecompressor {
         var dict: std.ArrayListUnmanaged(Sequence) = .{};
         var reverse_dict: ReverseDict = .{};
@@ -253,10 +254,10 @@ const LzwDecompressor = struct {
 
     }
 
-    pub fn step(self: *LzwDecompressor, scratch: std.mem.Allocator) !?Sequence {
+    pub fn step(self: *LzwDecompressor) !?Sequence {
         //std.debug.print("next code\n", .{});
         const next_code = try self.readCode();
-        defer self.last_code = next_code;
+
         std.debug.print("got code: {d} ({d})\n", .{next_code, self.code_size_bits});
 
         if (next_code == @as(u12, 1) << @intCast(self.initial_code_size)) {
@@ -273,7 +274,27 @@ const LzwDecompressor = struct {
             return null;
         }
 
+        defer self.last_code = next_code;
+
         //std.debug.print("lzw size: {d}, dict_size: {d}\n", .{self.code_size_bits, self.dictionary.items.len});
+
+        if (next_code >= self.dictionary.items.len) {
+
+            const last_sequence = self.dictionary.items[self.last_code.?];
+
+            const combined = try self.alloc.alloc(Code, last_sequence.len + 1);
+            @memcpy(combined[0..last_sequence.len], last_sequence);
+            combined[last_sequence.len] = last_sequence[0];
+
+            if (self.dictionary.items.len + 1 >= (@as(Code, 1) << @intCast(self.code_size_bits))) {
+                self.code_size_bits += 1;
+            }
+
+            try self.dictionary.append(self.alloc, combined);
+            std.debug.print("Inserted {any} at {d}\n", .{combined, self.dictionary.items.len - 1});
+
+            return combined;
+        }
 
         const next_sequence = self.dictionary.items[next_code];
         // FIXME: Actually error instead of crash
@@ -281,23 +302,17 @@ const LzwDecompressor = struct {
             std.debug.print("last code: {d}\n", .{lc});
             const last_sequence = self.dictionary.items[lc];
 
-            const combined = try scratch.alloc(Code, last_sequence.len + 1);
+            const combined = try self.alloc.alloc(Code, last_sequence.len + 1);
             @memcpy(combined[0..last_sequence.len], last_sequence);
             combined[last_sequence.len] = next_sequence[0];
 
-            const gop = try self.reverse_dictionary.getOrPut(self.alloc, combined);
 
-            if (!gop.found_existing) {
-                gop.key_ptr.* = try self.alloc.dupe(u12, combined);
-                gop.value_ptr.* = @intCast(self.dictionary.items.len);
-
-                if (gop.value_ptr.* >= (@as(Code, 1) << @intCast(self.code_size_bits))) {
-                    self.code_size_bits += 1;
-                }
-
-                try self.dictionary.append(self.alloc, gop.key_ptr.*);
-                std.debug.print("Inserted {any} at {d}\n", .{combined, gop.value_ptr.*});
+            if (self.dictionary.items.len + 1 >= (@as(Code, 1) << @intCast(self.code_size_bits))) {
+                self.code_size_bits += 1;
             }
+
+            try self.dictionary.append(self.alloc, combined);
+            std.debug.print("Inserted {any} at {d}\n", .{combined, self.dictionary.items.len - 1});
         }
 
         return next_sequence;
@@ -387,7 +402,37 @@ test "4 byte lzw decomrpession" {
 
     const expected: []const u12 = &.{3, 1, 2, 0};
     var i: usize = 0;
-    while (try lzwd.step(scratch.allocator())) |seq| {
+    while (try lzwd.step()) |seq| {
+        scratch.end_index = 0;
+        for (seq) |elem| {
+            try std.testing.expectEqual(expected[i], elem);
+            i += 1;
+        }
+    }
+}
+
+test "36 byte lzw decomrpession" {
+    var alloc_buf: [1 * 1024 * 1024]u8 = undefined;
+    var alloc = std.heap.FixedBufferAllocator.init(&alloc_buf);
+
+    var scratch_buf: [1 * 1024 * 1024]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&scratch_buf);
+
+    const input = &.{0x44, 0x6c, 0xa7, 0x80,  0xba, 0xd7, 0x52, 0x2c};
+    var r = std.Io.Reader.fixed(input);
+    var lzwd = try LzwDecompressor.init(alloc.allocator(), 2, &r);
+
+    const expected: []const u12 = &.{
+        0, 1, 0, 1, 0, 1,
+        1, 0, 1, 0, 1, 0,
+        0, 1, 0, 1, 0, 1,
+        1, 0, 1, 0, 1, 0,
+        0, 1, 0, 1, 0, 1,
+        1, 0, 1, 0, 1, 0,
+    };
+
+    var i: usize = 0;
+    while (try lzwd.step()) |seq| {
         scratch.end_index = 0;
         for (seq) |elem| {
             try std.testing.expectEqual(expected[i], elem);
