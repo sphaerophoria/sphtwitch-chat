@@ -80,6 +80,39 @@ const MessageWidgetFactory = struct {
     }
 };
 
+pub fn makeGui(scratch: *sphtud.alloc.BufAllocator, scratch_gl: *sphtud.render.GlAlloc, gui_alloc: sphtud.render.RenderAlloc, message_db: *MessageDb, font_size: f32) !*sphtud.ui.runner.Runner(GuiAction) {
+    try gui_alloc.reset();
+
+    const gui_state = try sphtud.ui.widget_factory.widgetState(
+        GuiAction,
+        gui_alloc,
+        scratch,
+        scratch_gl,
+        .{
+            .font_size = font_size,
+        },
+    );
+
+    const widget_factory = gui_state.factory(gui_alloc);
+
+    const message_factory =try gui_alloc.heap.arena().create(MessageWidgetFactory);
+    message_factory.* = MessageWidgetFactory{
+        .alloc = try gui_alloc.makeSubAlloc("messages"),
+        .state = gui_state,
+        .allocators = try .init(
+            gui_alloc.heap.arena(),
+            gui_alloc.heap.expansion(),
+            MessageDb.typical_messages,
+            MessageDb.max_messages,
+        ),
+        .message_db = message_db,
+    };
+
+    const ret = try gui_alloc.heap.arena().create(sphtud.ui.runner.Runner(GuiAction));
+    ret.* = try widget_factory.makeRunner(try widget_factory.makeScrollList(message_factory));
+    return ret;
+}
+
 pub fn main() !void {
     var allocators: sphtud.render.AppAllocators = undefined;
     try allocators.initPinned(10 * 1024 * 1024);
@@ -95,17 +128,6 @@ pub fn main() !void {
     gl.glEnable(gl.GL_SCISSOR_TEST);
     gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA);
     gl.glEnable(gl.GL_BLEND);
-
-    const gui_alloc = try allocators.root_render.makeSubAlloc("gui");
-
-    const gui_state = try sphtud.ui.widget_factory.widgetState(
-        GuiAction,
-        gui_alloc,
-        &allocators.scratch,
-        &allocators.scratch_gl,
-    );
-
-    const widget_factory = gui_state.factory(gui_alloc);
 
     var loop = try sphtud.event.Loop2.init();
 
@@ -145,19 +167,9 @@ pub fn main() !void {
         id_list.auth,
     );
 
-    var message_factory = MessageWidgetFactory{
-        .alloc = try allocators.root_render.makeSubAlloc("messages"),
-        .state = gui_state,
-        .allocators = try .init(
-            root_alloc.arena(),
-            root_alloc.expansion(),
-            MessageDb.typical_messages,
-            MessageDb.max_messages,
-        ),
-        .message_db = &message_db,
-    };
-
-    var runner = try widget_factory.makeRunner(try widget_factory.makeScrollList(&message_factory));
+    const gui_alloc = try allocators.root_render.makeSubAlloc("gui");
+    var font_size: f32 = 11.0;
+    var runner = try makeGui(scratch, &allocators.scratch_gl, gui_alloc, &message_db, font_size);
 
     while (!window.closed()) {
         allocators.resetScratch();
@@ -188,6 +200,21 @@ pub fn main() !void {
             .height = @intCast(height),
         }, &window.queue);
         _ = response;
+
+        for (runner.input_state.key_tracker.pressed_this_frame.items) |key_event| {
+            // A bit of a hack, but re-initializing the GUI is easy (even if it's slow)
+            if (key_event.key.eql(.{ .ascii = '='}) and key_event.ctrl) {
+                font_size += 1;
+                runner = try makeGui(scratch, &allocators.scratch_gl, gui_alloc, &message_db, font_size);
+                break;
+            }
+
+            if (key_event.key.eql(.{ .ascii = '-'}) and key_event.ctrl) {
+                font_size -= 1;
+                runner = try makeGui(scratch, &allocators.scratch_gl, gui_alloc, &message_db, font_size);
+                break;
+            }
+        }
 
         window.swapBuffers();
     }
