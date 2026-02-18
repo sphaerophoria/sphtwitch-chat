@@ -94,8 +94,7 @@ pub const Connection = struct {
             .record_writer = record_file.writer(&self.record_writer_buf),
         };
 
-        var reader_buf: [4096]u8 = undefined;
-        var record_reader = record_file.reader(&reader_buf);
+        var record_reader = record_file.reader(&self.ws_data_buf);
 
         try self.loadFromHistory(scratch, &record_reader.interface);
         try self.record_writer.seekTo(try record_file.getEndPos());
@@ -337,7 +336,7 @@ pub const Connection = struct {
                 .{ .ignore_unknown_fields = true },
             ) catch {
                 std.log.err("Invalid json message: {s}\n", .{message});
-                return;
+                continue;
             };
 
             const message_type = common.messageType() orelse continue;
