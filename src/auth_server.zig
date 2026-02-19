@@ -306,7 +306,7 @@ fn printAuthUrl(client_id: []const u8, oauth_state: *const OauthState) void {
         "?response_type=token" ++
         "&client_id={s}" ++
         "&redirect_uri=http://localhost:3000" ++
-        "&scope=user%3Abot+user%3Aread%3Achat+user%3Awrite%3Achat" ++
+        "&scope=user%3Abot+user%3Aread%3Achat+user%3Awrite%3Achat+moderator%3Amanage%3Achat_messages" ++
         "&state={s}";
 
     std.debug.print("Go here if you aren't authenticated (not on stream) " ++ loc ++ "\n", .{ client_id, oauth_state });
