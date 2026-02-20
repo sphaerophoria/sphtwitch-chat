@@ -1,4 +1,10 @@
 const std = @import("std");
+const sphtud = @import("sphtud");
+const sphrender = sphtud.render;
+const gl = sphrender.gl;
+const sphwindow = sphtud.window;
+const gui = sphtud.ui;
+const sphmath = sphtud.math;
 
 const GlobalPackedInfo = packed struct {
     ct_size: u3,
@@ -32,56 +38,409 @@ pub fn readColorTable(alloc: std.mem.Allocator, r: *std.Io.Reader, size_flag: u8
     return ret;
 }
 
+const GifAtlas = struct {
+    // RGBA pixels
+    atlas: []u8,
+    width_px: u32,
+    loop_count: u16,
+    frame_width_px: u32,
+    frame_height_px: u32,
+    timesteps: []const Timestep,
+
+    const Timestep = struct {
+        timestep_ms: u32,
+        // FIXME: add disposal method? Or inject into atlas directly
+        offs_x: u32,
+        offs_y: u32,
+    };
+
+    fn calcHeight(self: *const GifAtlas) u32 {
+        return @intCast(self.atlas.len / 4 / self.width_px);
+    }
+
+    const AtlasBuilder = struct {
+        data: std.ArrayList(u8),
+
+        // Unit: Number of images?
+        col_idx: u32,
+        imgs_per_row: u32,
+
+        img_width: u32,
+        img_height: u32,
+
+        fn init(img_width: u32, img_height: u32, max_width_px: u32) AtlasBuilder {
+            return .{
+                .data = .{},
+                .imgs_per_row = max_width_px / img_width,
+                .img_width = img_width,
+                .img_height = img_height,
+                .col_idx = std.math.maxInt(u32),
+            };
+        }
+
+        const AtlasImage = struct {
+            data: []u8,
+
+            start_offs_bytes: u32,
+            stride_bytes: u32,
+
+            x: u32,
+            y: u32,
+            width_px: u32,
+
+            fn pushPixel(self: *AtlasImage, r: u8, g: u8, b: u8, a: u8) void {
+                const px_offs = self.start_offs_bytes + (self.y * self.stride_bytes) + self.x * 4;
+                self.data[px_offs + 0] = r;
+                self.data[px_offs + 1] = g;
+                self.data[px_offs + 2] = b;
+                self.data[px_offs + 3] = a;
+                self.x += 1;
+                if (self.x >= self.width_px) {
+                    self.x = 0;
+                    self.y += 1;
+                }
+            }
+
+            fn startXPx(self: AtlasImage) u32 {
+                return (self.start_offs_bytes % self.stride_bytes) / 4;
+            }
+
+            fn startYPx(self: AtlasImage) u32 {
+                return (self.start_offs_bytes / self.stride_bytes);
+            }
+        };
+
+        fn allocImage(self: *AtlasBuilder, alloc: std.mem.Allocator) !AtlasImage {
+            const stride_bytes = self.strideBytes();
+            if (self.col_idx >= self.imgs_per_row) {
+                try self.data.appendNTimes(alloc, undefined, stride_bytes * self.img_height);
+                self.col_idx = 0;
+            }
+
+            const row_size_bytes = self.img_width * self.img_height * 4 * self.imgs_per_row;
+            const row_start = self.data.items.len - row_size_bytes;
+            const x_offs_bytes = self.col_idx * self.img_width * 4;
+
+            self.col_idx += 1;
+
+            return .{
+                .data = self.data.items,
+                .stride_bytes = stride_bytes,
+                .start_offs_bytes = @intCast(row_start + x_offs_bytes),
+                .x = 0,
+                .y = 0,
+                .width_px = self.img_width,
+            };
+        }
+
+        fn strideBytes(self: AtlasBuilder) u32 {
+            return self.imgs_per_row * self.img_width * 4;
+        }
+    };
+
+    fn load(alloc: std.mem.Allocator, scratch: std.mem.Allocator, r: *std.Io.Reader, max_width: u32) !GifAtlas {
+        var gr = try GifReader.init(scratch, r);
+
+        const data_buf = try scratch.alloc(u8, 4096);
+
+        var loop_count: u16 = 0;
+        var next_time_held_ms: u32 = 0;
+
+        var atlas_builder = AtlasBuilder.init(gr.width, gr.height, max_width);
+        var timesteps = std.ArrayList(Timestep){};
+        var timestep_ms: u32 = 0;
+
+        while (try gr.next(alloc, data_buf)) |item| {
+            switch (item) {
+                .nab_loop_count => |count| loop_count = count,
+                .graphic_control => |ctrl| next_time_held_ms = ctrl.delay_time_ms,
+                .image => |image| {
+                    var img = try atlas_builder.allocImage(scratch);
+                    try timesteps.append(scratch, .{
+                        .timestep_ms = timestep_ms,
+                        .offs_x = img.startXPx(),
+                        .offs_y = img.startYPx(),
+                    });
+                    while (try image.data.step()) |pallete_idx| {
+                        const rgb = image.palette[pallete_idx];
+                        img.pushPixel(rgb.r, rgb.g, rgb.b, 255);
+                    }
+
+                    timestep_ms += next_time_held_ms;
+                },
+                .extension => {},
+            }
+        }
+
+        return .{
+            .atlas = try alloc.dupe(u8, atlas_builder.data.items),
+            .width_px = atlas_builder.imgs_per_row * atlas_builder.img_width,
+            .loop_count = loop_count,
+            .timesteps = try alloc.dupe(Timestep, timesteps.items),
+            .frame_width_px = gr.width,
+            .frame_height_px = gr.height,
+        };
+    }
+};
+
+pub const GifWidget = struct {
+    atlas: sphrender.Texture,
+    prog: sphtud.render.xyuvt_program.Program(Uniform),
+    render_source: sphrender.xyuvt_program.RenderSource,
+    atlas_width_px: u32,
+    atlas_height_px: u32,
+    timestep_idx: usize,
+    frame_time_ms: usize,
+    timesteps: []const GifAtlas.Timestep,
+    frame_width_norm: f32,
+    frame_height_norm: f32,
+
+    const Uniform = struct {
+        transform: sphmath.Mat3x3,
+        input_image: sphtud.render.Texture,
+        offs_x: f32,
+        offs_y: f32,
+        width: f32,
+        height: f32,
+    };
+
+    pub const fragment_shader =
+        \\#version 330
+        \\in vec2 uv;
+        \\out vec4 fragment;
+        \\uniform sampler2D input_image;
+        \\uniform float offs_x;
+        \\uniform float offs_y;
+        \\uniform float width;
+        \\uniform float height;
+        \\void main()
+        \\{
+        \\    fragment = texture(input_image, vec2(uv.x * width + offs_x, ((1.0 - uv.y) * height + offs_y)));
+        \\}
+    ;
+
+    pub fn init(gl_alloc: *sphrender.GlAlloc, atlas: GifAtlas) !GifWidget {
+
+        const prog = try sphrender.xyuvt_program.Program(Uniform).init(gl_alloc, fragment_shader);
+        var render_source = try sphrender.xyuvt_program.RenderSource.init(gl_alloc);
+        render_source.bindData(prog.handle(), try sphrender.xyuvt_program.makeFullScreenPlane(gl_alloc));
+
+        const tex = try sphrender.makeTextureFromRgba(gl_alloc, atlas.atlas, atlas.width_px);
+
+        const atlas_height = atlas.calcHeight();
+
+        return .{
+            .atlas = tex,
+            .prog = prog,
+            .atlas_width_px = atlas.width_px,
+            .timesteps = atlas.timesteps,
+            .timestep_idx = 0,
+            .render_source = render_source,
+            .frame_height_norm = asf32(atlas.frame_height_px) / asf32(atlas_height),
+            .frame_width_norm = asf32(atlas.frame_width_px) / asf32(atlas.width_px),
+            .frame_time_ms = 0,
+            .atlas_height_px = atlas_height,
+        };
+    }
+
+        //pub const VTable = struct {
+        //    render: *const fn (ctx: ?*anyopaque, widget_bounds: PixelBBox, window_bounds: PixelBBox) void,
+        //    getSize: *const fn (ctx: ?*anyopaque) PixelSize,
+        //    update: ?*const fn (ctx: ?*anyopaque, available_size: PixelSize, delta_s: f32) anyerror!void,
+        //    setInputState: ?*const fn (ctx: ?*anyopaque, widget_bounds: PixelBBox, input_bounds: PixelBBox, input_state: *InputState) InputResponse(Action),
+        //    setFocused: ?*const fn (ctx: ?*anyopaque, focused: bool) void,
+        //    reset: ?*const fn (ctx: ?*anyopaque) void,
+        //
+
+    pub fn render(self: GifWidget, widget_bounds: gui.PixelBBox, window_bounds: gui.PixelBBox) void {
+        const transform = gui.util.widgetToClipTransform(widget_bounds, window_bounds);
+
+        const timestep = self.timesteps[self.timestep_idx];
+        self.prog.render(self.render_source, .{
+            .transform = transform.inner,
+            .input_image = self.atlas,
+            .offs_x = asf32(timestep.offs_x) / asf32(self.atlas_width_px),
+            .offs_y = asf32(timestep.offs_y) / asf32(self.atlas_height_px),
+            .width = self.frame_width_norm,
+            .height = self.frame_height_norm,
+        });
+    }
+
+    pub fn getSize(_: GifWidget) gui.PixelSize {
+        return .{ .width = 300, .height = 300 };
+    }
+
+    pub fn update(self: *GifWidget, _: gui.PixelSize, delta_s: f32) anyerror!void {
+        const delta_ms = delta_s * 1000;
+        self.frame_time_ms += @intFromFloat(delta_ms);
+
+        while (self.frame_time_ms >= self.timesteps[self.timestep_idx].timestep_ms) {
+            std.debug.print("advancing because frame time {d} > {d}\n", .{self.frame_time_ms, self.timesteps[self.timestep_idx].timestep_ms});
+            self.timestep_idx = (self.timestep_idx + 1);
+            if (self.timestep_idx >= self.timesteps.len) {
+                self.timestep_idx = 0;
+                self.frame_time_ms = 0;
+
+            }
+        }
+    }
+};
+
+const GuiAction = struct {};
+
+fn asf32(val: anytype) f32 {
+    return @floatFromInt(val);
+}
+
 pub fn main() !void {
-    var alloc = std.heap.FixedBufferAllocator.init(try std.heap.page_allocator.alloc(u8, 50 * 1024 * 1024));
+    var allocators: sphrender.AppAllocators = undefined;
+    try allocators.initPinned(10 * 1024 * 1024);
+
+    var window: sphwindow.Window = undefined;
+    try window.initPinned("sphui demo", 800, 600);
+
+    try sphrender.initGl(window.glLoader());
+
+    gl.glEnable(gl.GL_SCISSOR_TEST);
+    gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA);
+    gl.glEnable(gl.GL_BLEND);
+
+    const gui_alloc = try allocators.root_render.makeSubAlloc("gui");
+
+    const gui_state = try gui.widget_factory.widgetState(
+        GuiAction,
+        gui_alloc,
+        &allocators.scratch,
+        &allocators.scratch_gl,
+        .{},
+    );
+
 
     var gif_data_buf: [4 * 1024 * 1024]u8 = undefined;
-    const gif_data = try std.fs.cwd().readFile("some_emote.gif", &gif_data_buf);
+    const gif_data = try std.fs.cwd().readFile("bopbop.gif", &gif_data_buf);
 
     var r = std.Io.Reader.fixed(gif_data);
 
-    var gr = try GifReader.init(alloc.allocator(), &r);
+    const atlas = try GifAtlas.load(allocators.root.arena(), allocators.scratch.allocator(), &r, 128);
 
-    var first_image = false;
-    const cp = alloc.end_index;
-    var data_buf: [4096]u8 = undefined;
-    while (try gr.next(alloc.allocator(), &data_buf)) |item| {
-        defer alloc.end_index = cp;
+    // atlas has rgba pixels
+    var ppmf = try std.fs.cwd().createFile("test.ppm", .{});
+    defer ppmf.close();
 
-        switch (item) {
-            .extension => |data| {
-                std.debug.print("Extension {any}\n", .{data.extension_header});
-            },
-            .image => |data| {
-                std.debug.print("{d}x{d} image\n", .{data.width, data.height});
-                if (first_image) {
-                    first_image = false;
+    var ppmw_buf: [4096]u8 = undefined;
+    var ppmw = ppmf.writer(&ppmw_buf);
+    try ppmw.interface.print(
+        \\P6
+        \\{d} {d}
+        \\255
+        \\
+        , .{atlas.width_px, atlas.atlas.len / 4 / atlas.width_px});
 
-                    var ppmf = try std.fs.cwd().createFile("test.ppm", .{});
-                    defer ppmf.close();
-
-                    var ppmw_buf: [4096]u8 = undefined;
-                    var ppmw = ppmf.writer(&ppmw_buf);
-                    try ppmw.interface.print(
-                        \\P6
-                        \\{d} {d}
-                        \\255
-                        \\
-                        , .{data.width, data.height});
-
-                    while (try data.data.step()) |elem| {
-                        const px = data.palette[elem];
-                        try ppmw.interface.writeByte(px.r);
-                        try ppmw.interface.writeByte(px.g);
-                        try ppmw.interface.writeByte(px.b);
-                    }
-
-
-                    try ppmw.interface.flush();
-                }
-            },
-        }
+    var i: usize = 0;
+    while (i < atlas.atlas.len) {
+        defer i += 4;
+        try ppmw.interface.writeByte(atlas.atlas[i + 0]);
+        try ppmw.interface.writeByte(atlas.atlas[i + 1]);
+        try ppmw.interface.writeByte(atlas.atlas[i + 2]);
     }
+
+    try ppmw.interface.flush();
+
+    for (atlas.timesteps) |ts| {
+        std.debug.print("{any}\n", .{ts});
+    }
+
+    const widget_factory = gui_state.factory(gui_alloc);
+
+    var gif_widget = try GifWidget.init(gui_alloc.gl, atlas);
+    var runner = try widget_factory.makeRunner(
+        gui.Widget(GuiAction).fromConcrete(&gif_widget, "gif viewer"),
+    );
+
+    var last_frame = try std.time.Instant.now();
+
+    while (!window.closed()) {
+        allocators.resetScratch();
+
+        const now = try std.time.Instant.now();
+        defer last_frame = now;
+
+        const width, const height = window.getWindowSize();
+
+        gl.glViewport(0, 0, @intCast(width), @intCast(height));
+        gl.glScissor(0, 0, @intCast(width), @intCast(height));
+
+        const background_color = gui.widget_factory.StyleColors.background_color;
+        gl.glClearColor(background_color.r, background_color.g, background_color.b, background_color.a);
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT);
+
+        const delta_ns =now.since(last_frame);
+        _ = try runner.step(asf32(delta_ns) / 1e9, .{
+            .width = @intCast(width),
+            .height = @intCast(height),
+        }, &window.queue);
+
+        window.swapBuffers();
+    }
+    //var gr = try GifReader.init(alloc.allocator(), &r);
+
+    //var first_image = false;
+    //const cp = alloc.end_index;
+    //var data_buf: [4096]u8 = undefined;
+    //while (try gr.next(alloc.allocator(), &data_buf)) |item| {
+    //    defer alloc.end_index = cp;
+
+    //    switch (item) {
+    //        .nab_loop_count => |count| {
+    //            std.debug.print("loop count: {d}\n", .{count});
+    //        },
+    //        .graphic_control => |ctrl| {
+    //            std.debug.print("ctrl: {any}\n", .{ctrl});
+    //        },
+    //        .extension => |data| {
+    //            std.debug.print("extension label: {d} 0x{x}\n", .{data.label, data.label});
+
+    //            while (true) {
+    //                data.data.fillMore() catch |e| {
+    //                    if (e == error.EndOfStream) break;
+    //                    return e;
+    //                };
+
+    //                const buffered = data.data.buffered();
+    //                std.debug.print("{any}\n", .{buffered});
+    //                data.data.toss(buffered.len);
+    //            }
+    //        },
+    //        .image => |data| {
+    //            std.debug.print("{d}x{d} image\n", .{data.width, data.height});
+    //            if (first_image) {
+    //                first_image = false;
+
+    //                var ppmf = try std.fs.cwd().createFile("test.ppm", .{});
+    //                defer ppmf.close();
+
+    //                var ppmw_buf: [4096]u8 = undefined;
+    //                var ppmw = ppmf.writer(&ppmw_buf);
+    //                try ppmw.interface.print(
+    //                    \\P6
+    //                    \\{d} {d}
+    //                    \\255
+    //                    \\
+    //                    , .{data.width, data.height});
+
+    //                while (try data.data.step()) |elem| {
+    //                    const px = data.palette[elem];
+    //                    try ppmw.interface.writeByte(px.r);
+    //                    try ppmw.interface.writeByte(px.g);
+    //                    try ppmw.interface.writeByte(px.b);
+    //                }
+
+
+    //                try ppmw.interface.flush();
+    //            }
+    //        },
+    //    }
+    //}
 }
 
 const GifReader = struct {
@@ -97,10 +456,22 @@ const GifReader = struct {
     lzw_reader: ?LzwDecompressor = null,
 
     const Item = union(enum) {
+        nab_loop_count: u16,
+        graphic_control: struct {
+            user_input: bool,
+            disposal_method: enum (u3) {
+                none = 0,
+                do_not_dispose = 1,
+                restore_background = 2,
+                restore_previous = 3,
+                _,
+            },
+            delay_time_ms: u32,
+            transparent_color_idx: ?u8,
+        },
+        // FIXME: rename unhandled ext
         extension: struct {
             label: u8,
-            // Invalidates after reading from data
-            extension_header: []const u8,
             data: *std.Io.Reader,
         },
         image: struct {
@@ -164,14 +535,44 @@ const GifReader = struct {
             '!' => {
                 const label = try r.takeByte();
 
-                const block_size = try r.takeByte();
-                const extension_header = try r.take(block_size);
-
                 self.sub_reader = SubDataReader.init(self.input, data_buf);
+
+                if (label == 0xff) {
+                    const extension_header = try self.sub_reader.?.interface.peek(11);
+
+                    if (std.mem.eql(u8, extension_header, "NETSCAPE2.0")) {
+                        self.sub_reader.?.interface.toss(11);
+                        const sub_block_id = try self.sub_reader.?.interface.take(1);
+                        _ = sub_block_id;
+                        const loop_amount = try self.sub_reader.?.interface.takeInt(u16, .little);
+                        return .{
+                            .nab_loop_count = loop_amount,
+                        };
+                    }
+                } else if (label == 0xf9) {
+                    const GCPacked = packed struct {
+                        transparent: bool,
+                        user_input: bool,
+                        disposal_method: u3,
+                        reserved: u3,
+                    };
+
+                    const gc_packed = try self.sub_reader.?.interface.takeStruct(GCPacked, .little);
+                    const delay_time_cs = try self.sub_reader.?.interface.takeInt(u16, .little);
+                    const transparent_color_idx = try self.sub_reader.?.interface.takeByte();
+                    return .{
+                        .graphic_control = .{
+                            .user_input = gc_packed.user_input,
+                            .disposal_method = @enumFromInt(gc_packed.disposal_method),
+                            .delay_time_ms = @as(u32, delay_time_cs) * 10,
+                            .transparent_color_idx = if (gc_packed.transparent) transparent_color_idx else null,
+                        },
+                    };
+                }
+
                 return .{
                     .extension = .{
                         .label = label,
-                        .extension_header = extension_header,
                         .data = &self.sub_reader.?.interface,
                     },
                 };
@@ -232,6 +633,7 @@ const SubDataReader = struct {
     input: *std.Io.Reader,
     interface: std.Io.Reader,
     block_remaining_len: u8,
+    finished: bool,
 
     pub fn init(r: *std.Io.Reader, buffer: []u8) SubDataReader {
         return .{
@@ -245,15 +647,21 @@ const SubDataReader = struct {
                 },
             },
             .block_remaining_len = 0,
+            .finished = false,
         };
     }
 
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *SubDataReader = @fieldParentPtr("interface", r);
 
+        if (self.finished) return error.EndOfStream;
+
         if (self.block_remaining_len == 0) {
             self.block_remaining_len = try self.input.takeByte();
-            if (self.block_remaining_len == 0) return error.EndOfStream;
+            if (self.block_remaining_len == 0) {
+                self.finished = true;
+                return error.EndOfStream;
+            }
         }
 
         const merged_limit = limit.min(.limited(self.block_remaining_len));

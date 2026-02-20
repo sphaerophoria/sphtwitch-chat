@@ -26,5 +26,17 @@ pub fn build(b: *std.Build) !void {
     sphtwitch_chat.root_module.addImport("sphws", sphws);
     sphtwitch_chat.root_module.addImport("sphtud", sphtud);
 
+
+    const gif = b.addExecutable(.{
+        .name = "gif",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("gif.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    gif.root_module.addImport("sphtud", sphtud);
+
     b.installArtifact(sphtwitch_chat);
+    b.installArtifact(gif);
 }

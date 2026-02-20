@@ -92,7 +92,7 @@ pub const TintedImageWidget = struct {
             .tex = tex,
             .on_click = .delete_message,
             .size = .{
-                .width = 32, .height = 32,
+                .width = 16, .height = 16,
             },
             .hovered = false,
         };
@@ -353,6 +353,7 @@ pub fn main() !void {
             }
         }
 
+        // FIXME: This might block event loop if no events happen
         window.swapBuffers();
     }
 }
