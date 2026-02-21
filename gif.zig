@@ -32,145 +32,61 @@ pub fn readColorTable(buf: []u8, r: *std.Io.Reader, size_flag: u8) !img_mod.Pack
 
 const GifAtlas = struct {
     atlas: img_mod.PackedData(img_mod.Rgba8888Pixel),
-    width_px: u32,
-    loop_count: u16,
+
     frame_width_px: u32,
     frame_height_px: u32,
-    timesteps: []const Timestep,
 
-    const Timestep = struct {
-        timestep_ms: u32,
-        // FIXME: add disposal method? Or inject into atlas directly
-        offs_x: u32,
-        offs_y: u32,
-    };
+    loop_count: u16,
 
-    fn calcHeight(self: *const GifAtlas) u32 {
-        return @intCast(self.atlas.len() / self.width_px);
+    timesteps: []u32,
+
+    fn numImages(self: *const GifAtlas) usize {
+        return self.timesteps.len;
     }
 
-    const AtlasBuilder = struct {
-        data: std.ArrayList(u8),
-
-        // Unit: Number of images?
-        col_idx: u32,
-        imgs_per_row: u32,
-
-        img_width: u32,
-        img_height: u32,
-
-        fn init(img_width: u32, img_height: u32, max_width_px: u32) AtlasBuilder {
-            return .{
-                .data = .{},
-                .imgs_per_row = max_width_px / img_width,
-                .img_width = img_width,
-                .img_height = img_height,
-                .col_idx = std.math.maxInt(u32),
-            };
-        }
-
-        const AtlasImage = struct {
-            data: []u8,
-
-            start_offs_bytes: u32,
-            stride_bytes: u32,
-
-            x: u32,
-            y: u32,
-            width_px: u32,
-
-            fn pushPixel(self: *AtlasImage, px: img_mod.Rgba8888Pixel) void {
-                const px_offs = self.start_offs_bytes + (self.y * self.stride_bytes) + self.x * 4;
-                self.data[px_offs + 0] = px.r;
-                self.data[px_offs + 1] = px.g;
-                self.data[px_offs + 2] = px.b;
-                self.data[px_offs + 3] = px.a;
-
-                self.x += 1;
-                if (self.x >= self.width_px) {
-                    self.x = 0;
-                    self.y += 1;
-                }
-            }
-
-            fn startXPx(self: AtlasImage) u32 {
-                return (self.start_offs_bytes % self.stride_bytes) / 4;
-            }
-
-            fn startYPx(self: AtlasImage) u32 {
-                return (self.start_offs_bytes / self.stride_bytes);
-            }
-        };
-
-        fn allocImage(self: *AtlasBuilder, alloc: std.mem.Allocator) !AtlasImage {
-            const stride_bytes = self.strideBytes();
-            if (self.col_idx >= self.imgs_per_row) {
-                try self.data.appendNTimes(alloc, undefined, stride_bytes * self.img_height);
-                self.col_idx = 0;
-            }
-
-            const row_size_bytes = self.img_width * self.img_height * 4 * self.imgs_per_row;
-            const row_start = self.data.items.len - row_size_bytes;
-            const x_offs_bytes = self.col_idx * self.img_width * 4;
-
-            self.col_idx += 1;
-
-            return .{
-                .data = self.data.items,
-                .stride_bytes = stride_bytes,
-                .start_offs_bytes = @intCast(row_start + x_offs_bytes),
-                .x = 0,
-                .y = 0,
-                .width_px = self.img_width,
-            };
-        }
-
-        fn strideBytes(self: AtlasBuilder) u32 {
-            return self.imgs_per_row * self.img_width * 4;
-        }
-    };
-
-    fn load(alloc: std.mem.Allocator, r: *std.Io.Reader, max_width: u32) !GifAtlas {
+    fn load(alloc: std.mem.Allocator, r: *std.Io.Reader) !GifAtlas {
         var gr: GifReader = undefined;
         try gr.initPinned(r);
 
 
         var loop_count: u16 = 0;
         var next_time_held_ms: u32 = 0;
+        var transparent_color_idx: ?u8 = null;
 
-        var atlas_builder = AtlasBuilder.init(gr.width, gr.height, max_width);
+        var atlas_builder = std.ArrayList(u8){};
 
-        var timesteps = std.ArrayList(Timestep){};
+        var timesteps = std.ArrayList(u32){};
         var timestep_ms: u32 = 0;
 
         var data_buf: [4096]u8 = undefined;
         while (try gr.next(&data_buf)) |item| {
             switch (item) {
                 .nab_loop_count => |count| loop_count = count,
-                .graphic_control => |ctrl| next_time_held_ms = ctrl.delay_time_ms,
+                .graphic_control => |ctrl| {
+                    next_time_held_ms = ctrl.delay_time_ms;
+                    transparent_color_idx = ctrl.transparent_color_idx;
+                },
                 .image => |image| {
-                    var img = try atlas_builder.allocImage(alloc);
-
-                    try timesteps.append(alloc, .{
-                        .timestep_ms = timestep_ms,
-                        .offs_x = img.startXPx(),
-                        .offs_y = img.startYPx(),
-                    });
+                    try timesteps.append(alloc, timestep_ms);
+                    timestep_ms += next_time_held_ms;
 
                     while (try image.data.step()) |pallete_idx| {
                         const rgb = image.palette.get(pallete_idx);
-                        img.pushPixel(.from(rgb));
-                    }
 
-                    timestep_ms += next_time_held_ms;
+                        try atlas_builder.append(alloc, rgb.r);
+                        try atlas_builder.append(alloc, rgb.b);
+                        try atlas_builder.append(alloc, rgb.g);
+
+                        const alpha: u8 = if (pallete_idx == transparent_color_idx) 0 else 255;
+                        try atlas_builder.append(alloc, alpha);
+                    }
                 },
                 .extension => {},
             }
         }
 
         return .{
-            .atlas = .{ .data = atlas_builder.data.items },
-            .width_px = atlas_builder.imgs_per_row * atlas_builder.img_width,
+            .atlas = .{ .data = atlas_builder.items },
             .loop_count = loop_count,
             .timesteps = timesteps.items,
             .frame_width_px = gr.width,
@@ -179,17 +95,22 @@ const GifAtlas = struct {
     }
 };
 
+// FIXME: ImageSequenceWidget
 pub const GifWidget = struct {
     atlas: sphrender.Texture,
     prog: sphtud.render.xyuvt_program.Program(Uniform),
     render_source: sphrender.xyuvt_program.RenderSource,
-    atlas_width_px: u32,
-    atlas_height_px: u32,
     timestep_idx: usize,
     frame_time_ms: usize,
-    timesteps: []const GifAtlas.Timestep,
+    timesteps: []FrameData,
     frame_width_norm: f32,
     frame_height_norm: f32,
+
+    const FrameData = struct {
+        timestep_ms: u32,
+        offs_x_norm: f32,
+        offs_y_norm: f32,
+    };
 
     const Uniform = struct {
         transform: sphmath.Mat3x3,
@@ -215,38 +136,80 @@ pub const GifWidget = struct {
         \\}
     ;
 
-    pub fn init(gl_alloc: *sphrender.GlAlloc, atlas: GifAtlas) !GifWidget {
+    pub fn init(alloc: sphtud.render.RenderAlloc, atlas: GifAtlas) !GifWidget {
 
-        const prog = try sphrender.xyuvt_program.Program(Uniform).init(gl_alloc, fragment_shader);
-        var render_source = try sphrender.xyuvt_program.RenderSource.init(gl_alloc);
-        render_source.bindData(prog.handle(), try sphrender.xyuvt_program.makeFullScreenPlane(gl_alloc));
+        const prog = try sphrender.xyuvt_program.Program(Uniform).init(alloc.gl, fragment_shader);
+        var render_source = try sphrender.xyuvt_program.RenderSource.init(alloc.gl);
+        render_source.bindData(prog.handle(), try sphrender.xyuvt_program.makeFullScreenPlane(alloc.gl));
 
-        const tex = try sphrender.makeTextureFromRgba(gl_alloc, atlas.atlas.data, atlas.width_px);
+        // FIXME: Polled from OpenGL
+        const max_tex_height = 16384;
+        const max_tex_width = 16384;
 
-        const atlas_height = atlas.calcHeight();
+        // How many images can we fit in one column
+        const images_per_col = @min(atlas.numImages(), max_tex_height / atlas.frame_height_px);
+        const images_per_row = atlas.numImages() / images_per_col;
+
+        const tex_height_px = images_per_col * atlas.frame_height_px;
+        const tex_width_px = images_per_row * atlas.frame_width_px;
+
+        if (tex_width_px >= max_tex_width) return error.Unimplemented;
+
+        var framedata = std.ArrayList(FrameData){};
+
+        const tex = try sphrender.makeTextureCommon(alloc.gl);
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, @intCast(tex_width_px), @intCast(tex_height_px), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, null);
+
+        // FIXME: last column will be smaller
+        for (0..images_per_row) |x| {
+            const col_first_image_idx = x * images_per_col;
+            const px_idx = col_first_image_idx * atlas.frame_width_px * atlas.frame_height_px;
+
+            const col_height_images = atlas.numImages() - col_first_image_idx;
+            const col_height_px = col_height_images * atlas.frame_height_px;
+
+            const data = atlas.atlas.getSlice(px_idx, col_height_px);
+
+            const lod = 0;
+            const x_offs = x * atlas.frame_width_px;
+            const y_offs = 0;
+
+            // FIXME: intcast is dangerouso
+            gl.glTexSubImage2D(
+                gl.GL_TEXTURE_2D,
+                lod,
+                @intCast(x_offs),
+                y_offs,
+                @intCast(atlas.frame_width_px),
+                @intCast(col_height_px),
+                gl.GL_RGBA,
+                gl.GL_UNSIGNED_BYTE,
+                // FIXME: This will probably crash on the last col??
+                data.ptr,
+            );
+
+            const timestep_col_start = x * images_per_col;
+            const timestep_col_end = timestep_col_start + col_height_images;
+            for (atlas.timesteps[timestep_col_start..timestep_col_end], 0..) |ts, y| {
+                try framedata.append(alloc.heap.arena(), .{
+                    .timestep_ms = ts,
+                    .offs_x_norm = asf32(x) / asf32(tex_width_px),
+                    .offs_y_norm = asf32(y * atlas.frame_height_px) / asf32(tex_height_px),
+                });
+            }
+        }
 
         return .{
             .atlas = tex,
             .prog = prog,
-            .atlas_width_px = atlas.width_px,
-            .timesteps = atlas.timesteps,
+            .timesteps = framedata.items,
             .timestep_idx = 0,
             .render_source = render_source,
-            .frame_height_norm = asf32(atlas.frame_height_px) / asf32(atlas_height),
-            .frame_width_norm = asf32(atlas.frame_width_px) / asf32(atlas.width_px),
+            .frame_height_norm = asf32(atlas.frame_height_px) / asf32(tex_height_px),
+            .frame_width_norm = asf32(atlas.frame_width_px) / asf32(tex_width_px),
             .frame_time_ms = 0,
-            .atlas_height_px = atlas_height,
         };
     }
-
-        //pub const VTable = struct {
-        //    render: *const fn (ctx: ?*anyopaque, widget_bounds: PixelBBox, window_bounds: PixelBBox) void,
-        //    getSize: *const fn (ctx: ?*anyopaque) PixelSize,
-        //    update: ?*const fn (ctx: ?*anyopaque, available_size: PixelSize, delta_s: f32) anyerror!void,
-        //    setInputState: ?*const fn (ctx: ?*anyopaque, widget_bounds: PixelBBox, input_bounds: PixelBBox, input_state: *InputState) InputResponse(Action),
-        //    setFocused: ?*const fn (ctx: ?*anyopaque, focused: bool) void,
-        //    reset: ?*const fn (ctx: ?*anyopaque) void,
-        //
 
     pub fn render(self: GifWidget, widget_bounds: gui.PixelBBox, window_bounds: gui.PixelBBox) void {
         const transform = gui.util.widgetToClipTransform(widget_bounds, window_bounds);
@@ -255,8 +218,8 @@ pub const GifWidget = struct {
         self.prog.render(self.render_source, .{
             .transform = transform.inner,
             .input_image = self.atlas,
-            .offs_x = asf32(timestep.offs_x) / asf32(self.atlas_width_px),
-            .offs_y = asf32(timestep.offs_y) / asf32(self.atlas_height_px),
+            .offs_x = timestep.offs_x_norm,
+            .offs_y = timestep.offs_y_norm,
             .width = self.frame_width_norm,
             .height = self.frame_height_norm,
         });
@@ -311,13 +274,12 @@ pub fn main() !void {
         .{},
     );
 
-
     var gif_data_buf: [4 * 1024 * 1024]u8 = undefined;
     const gif_data = try std.fs.cwd().readFile("bopbop.gif", &gif_data_buf);
 
     var r = std.Io.Reader.fixed(gif_data);
 
-    const atlas = try GifAtlas.load(allocators.root.arena(), &r, 128);
+    const atlas = try GifAtlas.load(allocators.root.arena(), &r);
 
     // atlas has rgba pixels
     var ppmf = try std.fs.cwd().createFile("test.ppm", .{});
@@ -330,7 +292,7 @@ pub fn main() !void {
         \\{d} {d}
         \\255
         \\
-        , .{atlas.width_px, atlas.atlas.len() / atlas.width_px});
+        , .{atlas.frame_width_px, atlas.frame_height_px});
 
     var i: usize = 0;
     while (i < atlas.atlas.len()) {
@@ -349,7 +311,7 @@ pub fn main() !void {
 
     const widget_factory = gui_state.factory(gui_alloc);
 
-    var gif_widget = try GifWidget.init(gui_alloc.gl, atlas);
+    var gif_widget = try GifWidget.init(gui_alloc, atlas);
     var runner = try widget_factory.makeRunner(
         gui.Widget(GuiAction).fromConcrete(&gif_widget, "gif viewer"),
     );
@@ -379,6 +341,7 @@ pub fn main() !void {
 
         window.swapBuffers();
     }
+
     //var gr = try GifReader.init(alloc.allocator(), &r);
 
     //var first_image = false;
@@ -603,7 +566,6 @@ const GifReader = struct {
                 const lzw_min_code_size = try r.takeByte();
                 self.sub_reader = SubDataReader.init(r, data_buf);
 
-                // FIXME: Unsure of the correct way to initPinned an optional
                 const undef_lzw: LzwDecompressor = undefined;
                 self.lzw_reader = comptime undef_lzw;
                 try self.lzw_reader.?.initPinned(lzw_min_code_size, &self.sub_reader.?.interface);
