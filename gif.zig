@@ -1,5 +1,6 @@
 const std = @import("std");
 const sphtud = @import("sphtud");
+const img_mod = sphtud.img;
 const sphrender = sphtud.render;
 const gl = sphrender.gl;
 const sphwindow = sphtud.window;
@@ -19,28 +20,18 @@ const RGB = struct {
     b: u8,
 };
 
-pub fn readColorTable(alloc: std.mem.Allocator, r: *std.Io.Reader, size_flag: u8) ![]RGB {
+pub fn readColorTable(buf: []u8, r: *std.Io.Reader, size_flag: u8) !img_mod.PackedData(img_mod.Rgb888Pixel) {
     const ct_size_bytes = 3 * @as(usize, 1) << @intCast(@as(u8, size_flag) + 1);
 
-    const ret = try alloc.alloc(RGB, ct_size_bytes);
+    try r.readSliceAll(buf[0..ct_size_bytes]);
 
-    const color_table = try r.take(ct_size_bytes);
-    var i: usize = 0;
-    while (i < color_table.len) {
-        defer i += 3;
-        const red = color_table[i + 0];
-        const g = color_table[i + 1];
-        const b = color_table[i + 2];
-
-        ret[i / 3] = .{ .r = red, .g = g , .b = b };
-    }
-
-    return ret;
+    return .{
+        .data = buf[0..ct_size_bytes],
+    };
 }
 
 const GifAtlas = struct {
-    // RGBA pixels
-    atlas: []u8,
+    atlas: img_mod.PackedData(img_mod.Rgba8888Pixel),
     width_px: u32,
     loop_count: u16,
     frame_width_px: u32,
@@ -55,7 +46,7 @@ const GifAtlas = struct {
     };
 
     fn calcHeight(self: *const GifAtlas) u32 {
-        return @intCast(self.atlas.len / 4 / self.width_px);
+        return @intCast(self.atlas.len() / self.width_px);
     }
 
     const AtlasBuilder = struct {
@@ -88,12 +79,13 @@ const GifAtlas = struct {
             y: u32,
             width_px: u32,
 
-            fn pushPixel(self: *AtlasImage, r: u8, g: u8, b: u8, a: u8) void {
+            fn pushPixel(self: *AtlasImage, px: img_mod.Rgba8888Pixel) void {
                 const px_offs = self.start_offs_bytes + (self.y * self.stride_bytes) + self.x * 4;
-                self.data[px_offs + 0] = r;
-                self.data[px_offs + 1] = g;
-                self.data[px_offs + 2] = b;
-                self.data[px_offs + 3] = a;
+                self.data[px_offs + 0] = px.r;
+                self.data[px_offs + 1] = px.g;
+                self.data[px_offs + 2] = px.b;
+                self.data[px_offs + 3] = px.a;
+
                 self.x += 1;
                 if (self.x >= self.width_px) {
                     self.x = 0;
@@ -138,32 +130,36 @@ const GifAtlas = struct {
         }
     };
 
-    fn load(alloc: std.mem.Allocator, scratch: std.mem.Allocator, r: *std.Io.Reader, max_width: u32) !GifAtlas {
-        var gr = try GifReader.init(scratch, r);
+    fn load(alloc: std.mem.Allocator, r: *std.Io.Reader, max_width: u32) !GifAtlas {
+        var gr: GifReader = undefined;
+        try gr.initPinned(r);
 
-        const data_buf = try scratch.alloc(u8, 4096);
 
         var loop_count: u16 = 0;
         var next_time_held_ms: u32 = 0;
 
         var atlas_builder = AtlasBuilder.init(gr.width, gr.height, max_width);
+
         var timesteps = std.ArrayList(Timestep){};
         var timestep_ms: u32 = 0;
 
-        while (try gr.next(alloc, data_buf)) |item| {
+        var data_buf: [4096]u8 = undefined;
+        while (try gr.next(&data_buf)) |item| {
             switch (item) {
                 .nab_loop_count => |count| loop_count = count,
                 .graphic_control => |ctrl| next_time_held_ms = ctrl.delay_time_ms,
                 .image => |image| {
-                    var img = try atlas_builder.allocImage(scratch);
-                    try timesteps.append(scratch, .{
+                    var img = try atlas_builder.allocImage(alloc);
+
+                    try timesteps.append(alloc, .{
                         .timestep_ms = timestep_ms,
                         .offs_x = img.startXPx(),
                         .offs_y = img.startYPx(),
                     });
+
                     while (try image.data.step()) |pallete_idx| {
-                        const rgb = image.palette[pallete_idx];
-                        img.pushPixel(rgb.r, rgb.g, rgb.b, 255);
+                        const rgb = image.palette.get(pallete_idx);
+                        img.pushPixel(.from(rgb));
                     }
 
                     timestep_ms += next_time_held_ms;
@@ -173,10 +169,10 @@ const GifAtlas = struct {
         }
 
         return .{
-            .atlas = try alloc.dupe(u8, atlas_builder.data.items),
+            .atlas = .{ .data = atlas_builder.data.items },
             .width_px = atlas_builder.imgs_per_row * atlas_builder.img_width,
             .loop_count = loop_count,
-            .timesteps = try alloc.dupe(Timestep, timesteps.items),
+            .timesteps = timesteps.items,
             .frame_width_px = gr.width,
             .frame_height_px = gr.height,
         };
@@ -225,7 +221,7 @@ pub const GifWidget = struct {
         var render_source = try sphrender.xyuvt_program.RenderSource.init(gl_alloc);
         render_source.bindData(prog.handle(), try sphrender.xyuvt_program.makeFullScreenPlane(gl_alloc));
 
-        const tex = try sphrender.makeTextureFromRgba(gl_alloc, atlas.atlas, atlas.width_px);
+        const tex = try sphrender.makeTextureFromRgba(gl_alloc, atlas.atlas.data, atlas.width_px);
 
         const atlas_height = atlas.calcHeight();
 
@@ -321,7 +317,7 @@ pub fn main() !void {
 
     var r = std.Io.Reader.fixed(gif_data);
 
-    const atlas = try GifAtlas.load(allocators.root.arena(), allocators.scratch.allocator(), &r, 128);
+    const atlas = try GifAtlas.load(allocators.root.arena(), &r, 128);
 
     // atlas has rgba pixels
     var ppmf = try std.fs.cwd().createFile("test.ppm", .{});
@@ -334,14 +330,15 @@ pub fn main() !void {
         \\{d} {d}
         \\255
         \\
-        , .{atlas.width_px, atlas.atlas.len / 4 / atlas.width_px});
+        , .{atlas.width_px, atlas.atlas.len() / atlas.width_px});
 
     var i: usize = 0;
-    while (i < atlas.atlas.len) {
+    while (i < atlas.atlas.len()) {
         defer i += 4;
-        try ppmw.interface.writeByte(atlas.atlas[i + 0]);
-        try ppmw.interface.writeByte(atlas.atlas[i + 1]);
-        try ppmw.interface.writeByte(atlas.atlas[i + 2]);
+        const px = atlas.atlas.get(i);
+        try ppmw.interface.writeByte(px.r);
+        try ppmw.interface.writeByte(px.g);
+        try ppmw.interface.writeByte(px.b);
     }
 
     try ppmw.interface.flush();
@@ -450,7 +447,9 @@ const GifReader = struct {
     global_packed: GlobalPackedInfo,
     background_color: u8,
     pixel_aspect: u8,
-    global_ct: []const RGB,
+    global_ct_buf: [256 * 3]u8,
+    local_ct_buf: [256 * 3]u8,
+    global_ct: img_mod.PackedData(img_mod.Rgb888Pixel),
 
     sub_reader: ?SubDataReader = null,
     lzw_reader: ?LzwDecompressor = null,
@@ -480,13 +479,13 @@ const GifReader = struct {
             width: u16,
             height: u16,
             interlace: bool,
-            palette: []const RGB,
+            palette: img_mod.PackedData(img_mod.Rgb888Pixel),
             // FIXME: This should probably be a std.Io.Reader
             data: *LzwDecompressor,
         },
     };
 
-    pub fn init(alloc: std.mem.Allocator, r: *std.Io.Reader) !GifReader {
+    pub fn initPinned(self: *GifReader, r: *std.Io.Reader) !void {
         const sig = try r.take(3);
         const version = try r.take(3);
 
@@ -505,23 +504,24 @@ const GifReader = struct {
         const background_color = try r.takeByte();
         const pixel_aspect = try r.takeByte();
 
-        var global_ct: []const RGB = &.{};
-        if (global_packed.ct_present) {
-            global_ct = try readColorTable(alloc, r, global_packed.ct_size);
-        }
-
-        return .{
+        self.* = .{
             .input = r,
             .width = width,
             .height = height,
             .global_packed = global_packed,
             .background_color = background_color,
             .pixel_aspect = pixel_aspect,
-            .global_ct = global_ct,
+            .global_ct_buf = undefined,
+            .local_ct_buf = undefined,
+            .global_ct = .{ .data = &.{} },
         };
+
+        if (global_packed.ct_present) {
+            self.global_ct = try readColorTable(&self.global_ct_buf, r, global_packed.ct_size);
+        }
     }
 
-    pub fn next(self: *GifReader, alloc: std.mem.Allocator, data_buf: []u8) !?Item {
+    pub fn next(self: *GifReader, data_buf: []u8) !?Item {
         if (self.sub_reader) |*s| {
             _ = try s.interface.discardRemaining();
             self.sub_reader = null;
@@ -595,7 +595,7 @@ const GifReader = struct {
 
                 var color_table = self.global_ct;
                 if (options.lct_present) {
-                    color_table = try readColorTable(alloc, r, options.lct_size);
+                    color_table = try readColorTable(&self.local_ct_buf, r, options.lct_size);
                 }
                 std.debug.assert(self.global_packed.ct_present or options.lct_present);
 
