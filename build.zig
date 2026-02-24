@@ -39,4 +39,16 @@ pub fn build(b: *std.Build) !void {
 
     b.installArtifact(sphtwitch_chat);
     b.installArtifact(gif);
+
+
+    const font_demo = b.addExecutable(.{
+        .name = "font_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/font_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    font_demo.root_module.addImport("sphtud", sphtud);
+    b.installArtifact(font_demo);
 }
