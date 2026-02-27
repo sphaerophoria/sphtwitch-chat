@@ -51,4 +51,15 @@ pub fn build(b: *std.Build) !void {
     });
     font_demo.root_module.addImport("sphtud", sphtud);
     b.installArtifact(font_demo);
+
+    const font_demo_test = b.addTest(.{
+        .name = "font_demo_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/font_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    font_demo_test.root_module.addImport("sphtud", sphtud);
+    b.installArtifact(font_demo_test);
 }
