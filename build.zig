@@ -73,4 +73,26 @@ pub fn build(b: *std.Build) !void {
     });
     sdf_demo.root_module.addImport("sphtud", sphtud);
     b.installArtifact(sdf_demo);
+
+    const contour_merging_demo = b.addExecutable(.{
+        .name = "contour_merging_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/contour_merging_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    contour_merging_demo.root_module.addImport("sphtud", sphtud);
+    b.installArtifact(contour_merging_demo);
+
+    const contour_merging_demo_test = b.addTest(.{
+        .name = "contour_merging_demo_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/contour_merging_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    contour_merging_demo_test.root_module.addImport("sphtud", sphtud);
+    b.installArtifact(contour_merging_demo_test);
 }
